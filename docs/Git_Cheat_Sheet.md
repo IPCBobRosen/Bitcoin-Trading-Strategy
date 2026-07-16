@@ -51,3 +51,101 @@ git status
 
 Run `git status` again before committing to verify exactly which files will be
 included in the next snapshot.
+
+
+## Why run `git add .` more than once?
+
+It is perfectly normal to edit files after they have already been staged.
+
+When this happens:
+
+```text
+Edit file
+↓
+git add .
+↓
+Edit file again
+↓
+git status
+```
+
+Git will report:
+
+- Changes to be committed
+- Changes not staged for commit
+
+Simply run:
+
+```powershell
+git add .
+```
+
+again to update the staging area with the latest version of every file.
+
+
+## Creating a Git Repository
+
+### Command
+
+```powershell
+git init
+```
+
+### Purpose
+
+Creates a new Git repository in the current directory.
+
+### What happens?
+
+Git creates a hidden folder named:
+
+```text
+.git
+```
+
+This folder contains the project's complete version history, configuration,
+staging information, branches, and commit database.
+
+The presence of the `.git` folder tells Git that the directory is a Git
+repository.
+
+### Example
+
+```powershell
+cd C:\Projects\BitcoinTradingSystem
+git init
+```
+
+After running this command, Git begins managing the BTS project.
+
+
+## Rename the Current Branch
+
+### Command
+
+```powershell
+git branch -M main
+```
+
+### Purpose
+
+Renames the current Git branch to `main`.
+
+### Why?
+
+Modern Git repositories typically use `main` as the default branch instead of
+`master`.
+
+### Verify
+
+```powershell
+git branch
+```
+
+The active branch is indicated with an asterisk (`*`).
+
+Example:
+
+```text
+* main
+```
