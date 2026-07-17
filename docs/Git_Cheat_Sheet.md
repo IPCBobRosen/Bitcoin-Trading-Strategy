@@ -149,3 +149,34 @@ Example:
 ```text
 * main
 ```
+
+# Protocol
+
+A protocol is an agreed-upon set of rules that defines how two systems
+communicate.
+
+A protocol specifies:
+
+- Message format
+- Required fields
+- Data types
+- Message order
+- Error handling
+- Acknowledgments
+
+Good protocols eliminate ambiguity.
+
+Example:
+
+Instead of sending:
+
+BUY
+
+A protocol defines a complete message such as:
+
+- Signal
+- Symbol
+- Quantity
+- Timestamp
+- Strategy
+- Environment
