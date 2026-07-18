@@ -11,8 +11,8 @@ from app.communications.protocol import Environment
 class IncomingLifecycleEvent:
     """A validated lifecycle event received from the IPC Signal API.
 
-    This object preserves the communication envelope and the remaining
-    event-specific payload. It does not represent an executable order.
+    This object preserves the communication envelope and the event-specific
+    payload. It does not represent an executable order.
     """
 
     message_type: str
@@ -51,6 +51,7 @@ class IncomingLifecycleEvent:
         signal_id = message["signal_id"]
         timestamp_text = message["ts"]
         environment_text = message["env"]
+        raw_payload = message.get("payload", {})
 
         if not isinstance(message_type, str) or not message_type.strip():
             raise ValueError("'type' must be a non-empty string.")
@@ -82,18 +83,15 @@ class IncomingLifecycleEvent:
 
         try:
             environment = Environment(environment_text)
-        except ValueError as error:
+        except (TypeError, ValueError) as error:
             raise ValueError(
                 "'env' must be either 'staging' or 'live'."
             ) from error
 
-        envelope_fields = required_fields
+        if not isinstance(raw_payload, Mapping):
+            raise ValueError("'payload' must be a JSON object.")
 
-        payload = {
-            key: value
-            for key, value in message.items()
-            if key not in envelope_fields
-        }
+        payload = dict(raw_payload)
 
         return cls(
             message_type=message_type,

@@ -1,6 +1,7 @@
 """Tests for lifecycle events received from Eagle."""
 
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
@@ -8,18 +9,20 @@ from app.communications.incoming_event import IncomingLifecycleEvent
 from app.communications.protocol import Environment
 
 
-def create_valid_message() -> dict:
-    """Return a valid sample Eagle lifecycle message."""
+def create_valid_message() -> dict[str, Any]:
+    """Create a valid Eagle lifecycle-event message for testing."""
 
     return {
         "type": "fund.entry",
         "seq": 1204,
         "event_id": "event-001",
         "signal_id": "signal-001",
-        "ts": "2026-08-01T09:01:00Z",
+        "ts": "2026-08-01T09:01:00+00:00",
         "env": "staging",
-        "signal": {
-            "symbol": "BTCUSDT",
+        "payload": {
+            "signal": {
+                "symbol": "BTCUSDT",
+            }
         },
     }
 
@@ -35,6 +38,7 @@ def test_from_dict_creates_valid_event() -> None:
     assert event.seq == 1204
     assert event.event_id == "event-001"
     assert event.signal_id == "signal-001"
+
     assert event.timestamp == datetime(
         2026,
         8,
@@ -43,7 +47,9 @@ def test_from_dict_creates_valid_event() -> None:
         1,
         tzinfo=timezone.utc,
     )
+
     assert event.environment is Environment.STAGING
+
     assert event.payload == {
         "signal": {
             "symbol": "BTCUSDT",
@@ -52,7 +58,7 @@ def test_from_dict_creates_valid_event() -> None:
 
 
 def test_from_dict_rejects_missing_signal_id() -> None:
-    """A lifecycle event without signal_id should be rejected."""
+    """A message without signal_id should be rejected."""
 
     message = create_valid_message()
     del message["signal_id"]
@@ -65,7 +71,7 @@ def test_from_dict_rejects_missing_signal_id() -> None:
 
 
 def test_from_dict_rejects_invalid_environment() -> None:
-    """An environment other than staging or live should be rejected."""
+    """An unsupported environment should be rejected."""
 
     message = create_valid_message()
     message["env"] = "production"
@@ -78,7 +84,7 @@ def test_from_dict_rejects_invalid_environment() -> None:
 
 
 def test_from_dict_rejects_negative_sequence() -> None:
-    """A negative global sequence number should be rejected."""
+    """A negative sequence number should be rejected."""
 
     message = create_valid_message()
     message["seq"] = -1
