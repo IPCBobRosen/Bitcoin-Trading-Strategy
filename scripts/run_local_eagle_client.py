@@ -1,9 +1,9 @@
-"""Run the local Eagle-to-TradeRequest integration test."""
+"""Run the local Eagle-to-TradeCoordinator integration test."""
 
 import asyncio
 
 from app.communications.eagle_client import EagleClient
-from app.communications.trade_request import TradeRequest
+from app.trade_coordinator import TradeCoordinator
 from app.trading_controls import TradingControls
 
 
@@ -22,6 +22,8 @@ async def main() -> None:
         quantity=1,
         stop_loss_points=500,
     )
+
+    coordinator = TradeCoordinator(controls)
 
     print(f"Eagle address : {EAGLE_URI}")
     print(f"Trading paused: {controls.is_paused}")
@@ -45,19 +47,23 @@ async def main() -> None:
         print(f"Lifecycle event #{event_count} received and validated:")
         print(event)
 
-        if controls.is_paused:
-            print()
-            print("Trading is PAUSED.")
-            print("No TradeRequest was created.")
-            print()
-            continue
-
-        settings = controls.create_snapshot()
-        request = TradeRequest.from_event(event, settings)
+        decision = coordinator.process_event(event)
 
         print()
-        print("TradeRequest created:")
-        print(request)
+        print(
+            "Trade decision:",
+            f"approved={decision.approved},",
+            f"reason={decision.reason}",
+        )
+
+        if decision.trade_request is not None:
+            print()
+            print("TradeRequest created:")
+            print(decision.trade_request)
+        else:
+            print()
+            print("No TradeRequest was created.")
+
         print()
 
     print("-" * 60)

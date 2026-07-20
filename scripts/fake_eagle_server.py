@@ -41,8 +41,8 @@ async def handle_client(websocket: ServerConnection) -> None:
     intents = [
         "BUY_TO_OPEN",
         "SELL_TO_OPEN",
-        "BUY_TO_OPEN",
-        "SELL_TO_OPEN",
+        "BUY_TO_CLOSE",
+        "SELL_TO_CLOSE",
         "BUY_TO_OPEN",
     ]
 

@@ -1,5 +1,3 @@
-from app.communications.incoming_event import IncomingLifecycleEvent
-from app.communications.trade_request import TradeRequest
 """Coordinate validated Eagle events with BTS trading controls."""
 
 from app.communications.incoming_event import IncomingLifecycleEvent
@@ -24,7 +22,7 @@ class TradeCoordinator:
         self,
         event: IncomingLifecycleEvent,
     ) -> TradeDecision:
-        """Evaluate one Eagle event and return the resulting trade decision."""
+        """Evaluate one Eagle event and return a trade decision."""
 
         if self._controls.is_paused:
             return TradeDecision(
