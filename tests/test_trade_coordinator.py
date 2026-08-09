@@ -9,7 +9,7 @@ from app.trading_controls import TradingControls
 
 
 def create_test_event() -> IncomingLifecycleEvent:
-    """Create a valid lifecycle event for coordinator tests."""
+    """Create a valid accepted lifecycle event for coordinator tests."""
 
     return IncomingLifecycleEvent.from_dict(
         {
@@ -34,6 +34,7 @@ def test_process_event_rejects_event_when_trading_is_paused() -> None:
         quantity=1,
         stop_loss_points=500,
     )
+
     coordinator = TradeCoordinator(controls)
     event = create_test_event()
 
@@ -52,6 +53,7 @@ def test_process_event_creates_request_when_trading_is_enabled() -> None:
         quantity=1,
         stop_loss_points=500,
     )
+
     controls.resume()
 
     expected_settings = controls.create_snapshot()

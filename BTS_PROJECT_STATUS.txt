@@ -1,0 +1,739 @@
+================================================================================
+BITCOIN TRADING SYSTEM (BTS) — PROJECT STATUS
+================================================================================
+
+Project:
+Bitcoin Trading System (BTS)
+
+Organization:
+Infinite Point Capital
+
+Development Environment:
+VS Code / Python / Windows
+
+Project Location:
+C:\Projects\BitcoinTradingSystem
+
+GitHub:
+Repository is configured and project has been successfully pushed to GitHub.
+
+Last Status Update:
+August 9, 2026
+
+Current Automated Test Status:
+33 TESTS PASSING
+
+
+================================================================================
+1. SYSTEM PURPOSE
+================================================================================
+
+BTS is being developed as an automated execution and risk-management system.
+
+The machine-learning/signal system is Eagle.
+
+Eagle determines trading intent.
+
+BTS receives Eagle signals, validates them, applies local trading and risk
+controls, and ultimately submits approved orders to the execution broker.
+
+IMPORTANT ARCHITECTURAL RULE:
+
+Eagle expresses trading intent.
+
+BTS determines whether an order is allowed and controls actual execution.
+
+
+================================================================================
+2. CURRENT HIGH-LEVEL ARCHITECTURE
+================================================================================
+
+Eagle Cloud Infrastructure
+Oracle VPS
+WebSocket Server
+
+        |
+        | Secure WebSocket (wss://)
+        v
+
+EagleClient
+BTS WebSocket Client
+
+        |
+        v
+
+IncomingLifecycleEvent
+JSON validation / communication envelope
+
+        |
+        v
+
+Duplicate / Idempotency Protection
+
+        |
+        v
+
+TradeCoordinator
+
+        |
+        v
+
+TradeDecision
+
+        |
+        v
+
+TradeRequest (only when approved)
+
+        |
+        v
+
+Future BTS Risk Management Layer
+
+        |
+        v
+
+Future Interactive Brokers Execution Layer
+
+        |
+        v
+
+Interactive Brokers
+
+        |
+        v
+
+Execution / Fill / Position Reconciliation
+
+        |
+        v
+
+Logging + Eagle execution reporting
+
+
+================================================================================
+3. EXECUTION BROKER
+================================================================================
+
+CURRENT PLAN:
+
+Interactive Brokers (IBKR) will be used for order execution and account/risk
+information.
+
+CQG is no longer the planned execution interface for this BTS implementation.
+
+Future IB integration should provide BTS with information including:
+
+- Current positions
+- Open orders
+- Available funds
+- Excess liquidity
+- Buying power
+- Net liquidation value
+- Initial margin requirement
+- Maintenance margin requirement
+- Cash/account values
+- Order acknowledgements
+- Order status
+- Executions/fills
+- Partial fills
+- Average fill price
+- Remaining order quantity
+
+BTS should capture relevant IB account information before and after trades for
+risk management, reconciliation, and audit logging.
+
+
+================================================================================
+4. EAGLE COMMUNICATION ARCHITECTURE
+================================================================================
+
+Confirmed by Eagle/ML team:
+
+Eagle = WebSocket SERVER
+BTS   = WebSocket CLIENT
+
+Eagle runs in Eagle cloud infrastructure on an Oracle VPS.
+
+BTS initiates an outbound secure WebSocket connection to Eagle.
+
+Production/staging connection uses:
+
+wss://...
+
+Do NOT store API keys, authentication tokens, passwords, or other secrets
+directly in source code or commit them to GitHub.
+
+
+================================================================================
+5. EAGLE MESSAGE / PROTOCOL REQUIREMENTS
+================================================================================
+
+Important Eagle concepts:
+
+seq
+---
+Authoritative ordering/replay cursor.
+
+Ordering should use seq, NOT timestamps.
+
+event_id
+--------
+Unique event identifier.
+
+Used for idempotency / duplicate-event protection.
+
+BTS must never create a second broker action for the same event_id.
+
+signal_id
+---------
+Identifies the overall trading signal lifecycle.
+
+Used to associate entry/update/close activity belonging to the same signal.
+
+ts
+--
+Timestamp.
+
+Used primarily for audit/display purposes, not authoritative message ordering.
+
+
+Known Eagle message/lifecycle concepts include:
+
+- fund.hello
+- fund.entry
+- entry-price information
+- signal updates
+- BUY_TO_OPEN
+- SELL_TO_OPEN
+- BUY_TO_CLOSE
+- SELL_TO_CLOSE
+- heartbeat
+
+
+================================================================================
+6. EAGLE HEARTBEAT / CONNECTION REQUIREMENTS
+================================================================================
+
+Eagle application heartbeat:
+Approximately every 15 seconds.
+
+WebSocket ping:
+Approximately every 25 seconds.
+
+Connection should be considered unavailable after approximately 45 seconds
+without expected heartbeat/liveness.
+
+Future EagleClient must support:
+
+- Secure wss:// connection
+- Authentication
+- Heartbeat monitoring
+- Connection-state tracking
+- Reconnection
+- Replay/recovery
+- since_seq handling
+- Proper shutdown of old sockets before reconnecting
+- Protection against reconnect storms
+
+
+================================================================================
+7. EAGLE AUTHENTICATION ERROR BEHAVIOR
+================================================================================
+
+IMPORTANT CORRECTION FROM EAGLE TEAM:
+
+Invalid/missing API key does NOT result in WebSocket close code 4401.
+
+Authentication is rejected BEFORE the WebSocket upgrade completes.
+
+Expected behavior:
+
+HTTP 401 during WebSocket upgrade
+=
+Authentication/API-key problem.
+
+BTS must NOT continuously auto-retry an HTTP 401.
+
+Repeated authentication failures may trigger temporary lockout.
+
+
+HTTP 429
+--------
+May indicate rate limiting or too many WebSocket connections.
+
+Eagle limits each API key to:
+
+10 concurrent WebSocket connections.
+
+HTTP 429 may contain Retry-After.
+
+BTS must honor Retry-After and must not create a reconnect storm.
+
+DESIGN RULE:
+
+One live WebSocket per BTS process.
+
+
+================================================================================
+8. CURRENT TRADING CONTROLS
+================================================================================
+
+TradingControls currently provides trader-controlled settings including:
+
+- Pause/resume trading
+- Contract symbol
+- Quantity
+- Stop-loss points
+
+BTS should START PAUSED.
+
+Changes to trader-controlled settings affect future TradeRequests.
+
+TradeRequests contain an immutable snapshot of the settings that existed when
+the request was created.
+
+
+================================================================================
+9. TRADE COORDINATOR
+================================================================================
+
+TradeCoordinator is now the central decision point between validated Eagle
+events and TradeRequests.
+
+TradeCoordinator returns a TradeDecision rather than simply returning
+TradeRequest or None.
+
+Current decision reasons include:
+
+Approved
+TradingPaused
+DuplicateEvent
+
+Example:
+
+approved=False
+reason="TradingPaused"
+trade_request=None
+
+or:
+
+approved=True
+reason="Approved"
+trade_request=<TradeRequest>
+
+
+================================================================================
+10. DUPLICATE / IDEMPOTENCY PROTECTION
+================================================================================
+
+CURRENTLY IMPLEMENTED:
+
+app\idempotency_manager.py
+
+tests\test_idempotency_manager.py
+
+
+Current implementation tracks processed Eagle event_id values IN MEMORY.
+
+Important behavior:
+
+First occurrence:
+
+event_id = event-001
+
+Result:
+Accepted as new and remembered.
+
+
+Second occurrence:
+
+event_id = event-001
+
+Result:
+Duplicate.
+
+TradeCoordinator returns:
+
+approved=False
+reason="DuplicateEvent"
+trade_request=None
+
+
+IMPORTANT SAFETY RULE:
+
+An event received while BTS is paused is still considered processed.
+
+Example:
+
+Eagle sends event-001 while BTS is paused.
+
+Result:
+TradingPaused.
+
+Trader later resumes BTS.
+
+Eagle replays event-001.
+
+Result:
+DuplicateEvent.
+
+The old signal MUST NOT suddenly become executable simply because BTS was
+resumed.
+
+
+CURRENT LIMITATION:
+
+Idempotency information exists only in memory.
+
+If BTS or Windows restarts, the current manager forgets processed event IDs.
+
+BEFORE LIVE EXECUTION:
+
+Replace or back the in-memory system with persistent storage, most likely
+SQLite.
+
+
+================================================================================
+11. CURRENT TEST STATUS
+================================================================================
+
+33 automated tests passing as of August 9, 2026.
+
+Recent idempotency tests verify:
+
+- New event IDs have not been processed.
+- Processed event IDs are remembered.
+- check_and_mark accepts new events.
+- check_and_mark rejects duplicates.
+- Different event IDs are tracked independently.
+- Invalid/empty event IDs are rejected.
+
+TradeCoordinator tests verify:
+
+- TradingPaused rejection.
+- Approved TradeRequest creation.
+- DuplicateEvent rejection.
+- An event received while paused cannot execute later after resume.
+
+All existing tests continue to pass.
+
+
+================================================================================
+12. LOCAL EAGLE INTEGRATION TEST
+================================================================================
+
+Fake Eagle server:
+
+scripts\fake_eagle_server.py
+
+Local BTS client:
+
+scripts\run_local_eagle_client.py
+
+
+Run fake Eagle server from project root:
+
+python -m scripts.fake_eagle_server
+
+
+Run BTS client from second terminal:
+
+python -m scripts.run_local_eagle_client
+
+
+IMPORTANT:
+
+Running:
+
+python scripts/run_local_eagle_client.py
+
+previously caused:
+
+ModuleNotFoundError: No module named 'app'
+
+Therefore use Python module execution from the project root:
+
+python -m scripts.run_local_eagle_client
+
+
+Local integration testing successfully received multiple WebSocket events.
+
+All four supported trade intents have been exercised:
+
+BUY_TO_OPEN
+SELL_TO_OPEN
+BUY_TO_CLOSE
+SELL_TO_CLOSE
+
+When BTS was paused, each event correctly resulted in:
+
+approved=False
+reason=TradingPaused
+
+No TradeRequest was created.
+
+
+================================================================================
+13. EAGLE REPLAY / RECOVERY REQUIREMENTS
+================================================================================
+
+Future BTS reconnect logic must support Eagle replay/recovery.
+
+Important concepts:
+
+- Persist last durable seq.
+- Reconnect using since_seq.
+- Receive fund.hello.
+- Process replayed events safely.
+- Duplicate event_id values must never generate duplicate broker actions.
+- Reconcile state before returning to normal live processing.
+
+Do not assume every seq must equal previous seq + 1.
+
+Sequence gaps may legitimately occur depending on heartbeat/filter/channel
+behavior.
+
+seq remains the authoritative ordering/recovery cursor.
+
+
+================================================================================
+14. FUTURE PERSISTENT STORAGE
+================================================================================
+
+Planned persistent storage:
+
+SQLite.
+
+Likely information to persist:
+
+- Processed Eagle event_id values
+- Last durable seq
+- Signal lifecycle state
+- Trade decisions
+- Broker order identifiers
+- Execution/fill information
+- Reconciliation information
+- Possibly audit/logging metadata
+
+Persistence must survive:
+
+- BTS restart
+- Windows restart
+- Eagle disconnect/reconnect
+- Eagle replay
+- Unexpected application termination
+
+
+================================================================================
+15. INTERACTIVE BROKERS RISK MANAGEMENT PLAN
+================================================================================
+
+Before submitting a trade, BTS should eventually evaluate information such as:
+
+- Is IB connected?
+- Is account data current?
+- Current position
+- Existing working orders
+- Available funds
+- Excess liquidity
+- Initial margin
+- Maintenance margin
+- Buying power
+- Net liquidation value
+- Trader-defined maximum position
+- Trader-defined risk limits
+- Duplicate-event status
+- BTS pause status
+
+After execution BTS should reconcile:
+
+Expected position
+versus
+Actual IB position.
+
+BTS should also record:
+
+- IB order ID
+- Contract/conId
+- Side
+- Quantity
+- Order type
+- Requested price
+- Stop information
+- Submission timestamp
+- Order status
+- Filled quantity
+- Remaining quantity
+- Average fill price
+- Execution IDs
+- Fill timestamps
+- Relevant commissions when available
+
+
+================================================================================
+16. FUTURE BTS COMPONENTS
+================================================================================
+
+Planned or likely future components include:
+
+Sequence Manager
+Persistent Event Store
+Connection State Manager
+Eagle Reconnection Manager
+Replay / Reconciliation Manager
+Interactive Brokers Connection Manager
+IB Risk Manager
+IB Order Manager
+Execution / Fill Manager
+Execution Reporter
+Health Monitor
+Audit Logger
+Configuration Manager
+
+Exact file names should be decided when each component is implemented.
+
+Before modifying an EXISTING source file, review its current contents first to
+preserve existing constants, function names, classes, imports, and conventions.
+
+
+================================================================================
+17. TWO-TRADER FUTURE PRODUCTION PLAN
+================================================================================
+
+DO NOT implement this until the Florida BTS computer is live and stable.
+
+Future requirement:
+
+Support a second trader/BTS computer without allowing simultaneous execution
+control over the same trading account.
+
+Target architecture:
+
+Only ONE BTS execution client may control an account at a time.
+
+Potential Eagle/server handover process:
+
+1. Trader 1 requests server-side handover pause.
+2. Eagle confirms signal delivery paused.
+3. Verify no signal/order remains in flight.
+4. Trader 1 releases execution control.
+5. Trader 2 connects and authenticates.
+6. Trader 2 claims execution control.
+7. Trader 2 verifies broker account/position/working-order state.
+8. Trader 2 enables local BTS.
+9. Trader 2 requests Eagle resume.
+10. Eagle resumes new signal delivery.
+
+Both Eagle and the receiving BTS should remain safely paused during the
+handover.
+
+Potential server commands/concepts:
+
+HANDOVER_PAUSE
+CLAIM_EXECUTION_CONTROL
+RELEASE_EXECUTION_CONTROL
+HANDOVER_RESUME
+STATUS_REQUEST
+
+Each BTS installation should eventually have its own:
+
+- Client identity
+- Authentication credentials
+- Audit trail
+- Execution ownership information
+
+Signals generated during handover should NOT automatically be replayed and
+executed if they have become stale.
+
+
+================================================================================
+18. DEVELOPMENT WORKFLOW
+================================================================================
+
+Preferred workflow:
+
+1. Identify next component.
+2. If modifying an existing file, inspect current contents first.
+3. Create/update implementation.
+4. Create/update matching tests.
+5. Run focused tests.
+6. Fix failures.
+7. Run complete test suite.
+8. Update BTS_PROJECT_STATUS.txt when appropriate.
+9. git status
+10. git add .
+11. git status
+12. git commit
+13. git push
+
+
+================================================================================
+19. GIT / GITHUB
+================================================================================
+
+Main branch is being used.
+
+Remote repository has been configured successfully.
+
+Project has previously been pushed successfully to GitHub.
+
+Do NOT commit:
+
+- API keys
+- Passwords
+- Authentication tokens
+- Private certificates
+- Broker credentials
+- Other secrets
+
+
+================================================================================
+20. CURRENT DEVELOPMENT POSITION
+================================================================================
+
+COMPLETED:
+
+- Basic Eagle protocol objects
+- Incoming lifecycle-event validation
+- TradeIntent definitions
+- Environment definitions
+- TradeRequest
+- TradingControls
+- TradingSettingsSnapshot
+- TradeDecision
+- TradeCoordinator
+- Eagle WebSocket client foundation
+- Fake Eagle WebSocket server
+- Continuous local message reception
+- All four trade intents tested
+- In-memory IdempotencyManager
+- DuplicateEvent coordinator integration
+
+CURRENT TEST COUNT:
+
+33 PASSING
+
+
+NEXT DEVELOPMENT STEP:
+
+Build the Sequence Manager independently.
+
+Proposed files:
+
+app\sequence_manager.py
+
+tests\test_sequence_manager.py
+
+
+After sequence handling is implemented and tested:
+
+- Integrate it carefully with existing processing.
+- Continue Eagle connection/recovery infrastructure.
+- Add persistent SQLite storage so processed event IDs and sequence cursor
+  survive application/computer restarts.
+
+
+================================================================================
+END OF CURRENT PROJECT STATUS
+================================================================================

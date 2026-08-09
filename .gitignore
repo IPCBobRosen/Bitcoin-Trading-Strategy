@@ -39,3 +39,8 @@ dist/
 
 .coverage
 htmlcov/
+
+data/
+*.db
+*.sqlite
+*.sqlite3
