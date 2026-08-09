@@ -192,86 +192,8 @@ class EventStore:
             )
 
             return True
-        def check_and_mark_event_with_seq(
-        self,
-        event_id: str,
-        seq: int,
-    ) -> EventProcessingResult:
-         """Atomically evaluate and persist an Eagle event and sequence.
 
-        The event ID and sequence cursor are committed together.
-
-        Returns:
-            EventProcessingResult.ACCEPTED:
-                The event ID is new and the sequence is newer. Both are
-                persisted in one SQLite transaction.
-
-            EventProcessingResult.DUPLICATE_EVENT:
-                The event ID has already been processed. Nothing changes.
-
-            EventProcessingResult.OUT_OF_SEQUENCE:
-                The event ID is new, but the sequence is equal to or older
-                than the durable cursor. Nothing changes."""
-
-        self._validate_event_id(event_id)
-        self._validate_seq(seq)
-
-        with self._connect() as connection:
-            duplicate_row = connection.execute(
-                """
-                SELECT 1
-                FROM processed_events
-                WHERE event_id = ?
-                LIMIT 1
-                """,
-                (event_id,),
-            ).fetchone()
-
-            if duplicate_row is not None:
-                return EventProcessingResult.DUPLICATE_EVENT
-
-            sequence_row = connection.execute(
-                """
-                SELECT last_seq
-                FROM sequence_state
-                WHERE id = 1
-                """
-            ).fetchone()
-
-            if sequence_row is not None:
-                current_seq = int(sequence_row[0])
-
-                if seq <= current_seq:
-                    return EventProcessingResult.OUT_OF_SEQUENCE
-
-            connection.execute(
-                """
-                INSERT INTO processed_events (event_id)
-                VALUES (?)
-                """,
-                (event_id,),
-            )
-
-            if sequence_row is None:
-                connection.execute(
-                    """
-                    INSERT INTO sequence_state (id, last_seq)
-                    VALUES (1, ?)
-                    """,
-                    (seq,),
-                )
-            else:
-                connection.execute(
-                    """
-                    UPDATE sequence_state
-                    SET last_seq = ?
-                    WHERE id = 1
-                    """,
-                    (seq,),
-                )
-
-        return EventProcessingResult.ACCEPTED
-
+      
     def check_and_mark_event_with_seq(
         self,
         event_id: str,

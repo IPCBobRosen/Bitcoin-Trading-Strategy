@@ -4,8 +4,12 @@ import asyncio
 from pathlib import Path
 
 from app.communications.eagle_client import EagleClient
+from app.communications.eagle_heartbeat import EagleHeartbeat
+from app.communications.eagle_hello import EagleHello
+from app.communications.incoming_event import IncomingLifecycleEvent
 from app.event_processor import EventProcessStatus, EventProcessor
 from app.event_store import EventStore
+from app.heartbeat_processor import HeartbeatProcessor
 from app.trade_coordinator import TradeCoordinator
 from app.trading_controls import TradingControls
 
@@ -16,7 +20,7 @@ DATABASE_PATH = Path("data") / "local_eagle_events.db"
 
 
 async def main() -> None:
-    """Continuously receive and process Eagle lifecycle events."""
+    """Continuously receive and route validated Eagle messages."""
 
     print("=" * 60)
     print("Bitcoin Trading System - Local Eagle Client Test")
@@ -29,8 +33,18 @@ async def main() -> None:
     )
 
     event_store = EventStore(DATABASE_PATH)
-    event_processor = EventProcessor(event_store)
-    coordinator = TradeCoordinator(controls)
+
+    event_processor = EventProcessor(
+        event_store
+    )
+
+    heartbeat_processor = HeartbeatProcessor(
+        event_store
+    )
+
+    coordinator = TradeCoordinator(
+        controls
+    )
 
     print(f"Eagle address  : {EAGLE_URI}")
     print(f"Trading paused : {controls.is_paused}")
@@ -38,62 +52,152 @@ async def main() -> None:
     print(f"Quantity       : {controls.quantity}")
     print(f"Stop loss      : {controls.stop_loss_points}")
     print(f"Event database : {DATABASE_PATH}")
+    print(f"Last durable seq: {event_store.get_last_seq()}")
     print()
 
     client = EagleClient(EAGLE_URI)
 
     print("Connecting to fake Eagle server...")
-    print("Listening for lifecycle events...")
+    print("Listening for Eagle messages...")
     print()
 
-    event_count = 0
+    message_count = 0
+    lifecycle_count = 0
+    heartbeat_count = 0
+    hello_count = 0
 
-    async for event in client.listen():
-        event_count += 1
+    async for message in client.listen():
+        message_count += 1
 
         print("-" * 60)
-        print(
-            f"Lifecycle event #{event_count} "
-            "received and validated:"
-        )
-        print(event)
 
-        process_result = event_processor.process(event)
+        if isinstance(message, EagleHello):
+            hello_count += 1
 
-        print()
-        print(
-            "Event processing:",
-            process_result.status.value,
-        )
+            print(
+                f"Eagle hello #{hello_count} "
+                "received and validated:"
+            )
+            print(message)
 
-        if process_result.status is not EventProcessStatus.ACCEPTED:
-            print("Event will not continue to TradeCoordinator.")
+            print()
+            print("Connection snapshot:")
+            print(f"Server last seq : {message.last_seq}")
+            print(f"Requested since : {message.since_seq}")
+            print(f"Replay count    : {message.replay_count}")
+            print(f"Open positions  : {message.open_count}")
+            print(f"Environment     : {message.environment.value}")
+
+            print()
+            print(
+                "fund.hello is a control frame. "
+                "No TradeRequest will be created."
+            )
+
             print()
             continue
 
-        decision = coordinator.process_event(event)
+        if isinstance(message, EagleHeartbeat):
+            heartbeat_count += 1
 
-        print()
-        print(
-            "Trade decision:",
-            f"approved={decision.approved},",
-            f"reason={decision.reason}",
+            print(
+                f"Heartbeat #{heartbeat_count} "
+                "received and validated:"
+            )
+            print(message)
+
+            heartbeat_processor.process(message)
+
+            print()
+            print(
+                "Heartbeat sequence persisted:",
+                message.seq,
+            )
+
+            print(
+                "Last durable seq:",
+                event_store.get_last_seq(),
+            )
+
+            print(
+                "Heartbeat is a control frame. "
+                "No TradeRequest will be created."
+            )
+
+            print()
+            continue
+
+        if isinstance(message, IncomingLifecycleEvent):
+            lifecycle_count += 1
+
+            print(
+                f"Lifecycle event #{lifecycle_count} "
+                "received and validated:"
+            )
+            print(message)
+
+            process_result = event_processor.process(
+                message
+            )
+
+            print()
+            print(
+                "Event processing:",
+                process_result.status.value,
+            )
+
+            if (
+                process_result.status
+                is not EventProcessStatus.ACCEPTED
+            ):
+                print(
+                    "Event will not continue "
+                    "to TradeCoordinator."
+                )
+                print()
+                continue
+
+            decision = coordinator.process_event(
+                message
+            )
+
+            print()
+            print(
+                "Trade decision:",
+                f"approved={decision.approved},",
+                f"reason={decision.reason}",
+            )
+
+            if decision.trade_request is not None:
+                print()
+                print("TradeRequest created:")
+                print(decision.trade_request)
+
+            else:
+                print()
+                print("No TradeRequest was created.")
+
+            print()
+            continue
+
+        raise RuntimeError(
+            f"Unsupported Eagle message type: "
+            f"{type(message).__name__}"
         )
 
-        if decision.trade_request is not None:
-            print()
-            print("TradeRequest created:")
-            print(decision.trade_request)
-        else:
-            print()
-            print("No TradeRequest was created.")
-
-        print()
-
     print("-" * 60)
+
     print(
         f"Eagle connection closed after "
-        f"{event_count} event(s)."
+        f"{message_count} total message(s)."
+    )
+
+    print(f"Hello frames     : {hello_count}")
+    print(f"Heartbeats       : {heartbeat_count}")
+    print(f"Lifecycle events : {lifecycle_count}")
+    print(
+        f"Last durable seq : "
+        f"{event_store.get_last_seq()}"
     )
 
 

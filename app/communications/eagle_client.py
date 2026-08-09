@@ -1,33 +1,75 @@
-"""WebSocket client for receiving lifecycle events from Eagle."""
+"""WebSocket client for receiving messages from Eagle."""
 
 import json
 from collections.abc import AsyncIterator
 from typing import Any
 
 from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from app.communications.eagle_heartbeat import EagleHeartbeat
+from app.communications.eagle_hello import EagleHello
 from app.communications.incoming_event import IncomingLifecycleEvent
 
 
+EagleMessage = (
+    EagleHello
+    | EagleHeartbeat
+    | IncomingLifecycleEvent
+)
+
+
+class EagleAuthenticationError(ConnectionError):
+    """Raised when Eagle rejects the WebSocket handshake with HTTP 401."""
+
+
+class EagleRateLimitError(ConnectionError):
+    """Raised when Eagle rejects the WebSocket handshake with HTTP 429."""
+
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class EagleClient:
-    """Connect to Eagle and convert JSON messages into lifecycle events."""
+    """Connect to Eagle and convert JSON frames into validated messages."""
 
-    def __init__(self, uri: str) -> None:
+    def __init__(
+        self,
+        uri: str,
+        api_key: str | None = None,
+    ) -> None:
         """Create an Eagle WebSocket client.
 
         Args:
             uri:
                 WebSocket address of the Eagle server, such as
-                ``ws://localhost:8765``.
+                ``ws://localhost:8765`` or an Eagle ``wss://`` address.
+
+            api_key:
+                Optional Eagle API key used for authentication.
+
+                When supplied, BTS sends the key in the ``x-api-key``
+                HTTP header during the WebSocket opening handshake.
         """
 
         if not isinstance(uri, str) or not uri.strip():
             raise ValueError("'uri' must be a non-empty string.")
 
+        if api_key is not None:
+            if not isinstance(api_key, str) or not api_key.strip():
+                raise ValueError(
+                    "'api_key' must be a non-empty string when supplied."
+                )
+
+            api_key = api_key.strip()
+
         self._uri = uri.strip()
+        self._api_key = api_key
 
     @property
     def uri(self) -> str:
@@ -35,24 +77,86 @@ class EagleClient:
 
         return self._uri
 
+    @property
+    def has_api_key(self) -> bool:
+        """Return True when an Eagle API key is configured."""
+
+        return self._api_key is not None
+
+    def _connection_headers(self) -> dict[str, str] | None:
+        """Create authentication headers for the WebSocket handshake."""
+
+        if self._api_key is None:
+            return None
+
+        return {
+            "x-api-key": self._api_key,
+        }
+
     @staticmethod
-    def _parse_message(raw_message: str) -> IncomingLifecycleEvent:
-        """Parse one raw JSON message received from Eagle.
+    def _parse_retry_after(value: str | None) -> int | None:
+        """Parse an integer Retry-After value from an HTTP header."""
 
-        Args:
-            raw_message:
-                JSON text received from the WebSocket.
+        if value is None:
+            return None
 
-        Returns:
-            A validated IncomingLifecycleEvent.
+        try:
+            retry_after = int(value)
+        except ValueError:
+            return None
 
-        Raises:
-            TypeError:
-                If raw_message isn't a string.
+        if retry_after < 0:
+            return None
 
-            ValueError:
-                If the message isn't valid JSON, isn't a JSON object,
-                or doesn't satisfy the lifecycle-event blueprint.
+        return retry_after
+
+    @classmethod
+    def _raise_for_handshake_error(
+        cls,
+        error: InvalidStatus,
+    ) -> None:
+        """Translate Eagle HTTP handshake failures into BTS exceptions."""
+
+        status_code = error.response.status_code
+
+        if status_code == 401:
+            raise EagleAuthenticationError(
+                "Eagle rejected the WebSocket connection because "
+                "authentication failed."
+            ) from error
+
+        if status_code == 429:
+            retry_after_value = error.response.headers.get(
+                "Retry-After"
+            )
+
+            retry_after_seconds = cls._parse_retry_after(
+                retry_after_value
+            )
+
+            raise EagleRateLimitError(
+                "Eagle rejected the WebSocket connection because "
+                "the client is rate limited or has too many active "
+                "connections.",
+                retry_after_seconds=retry_after_seconds,
+            ) from error
+
+        raise ConnectionError(
+            f"Eagle WebSocket handshake failed with HTTP "
+            f"{status_code}."
+        ) from error
+
+    @staticmethod
+    def _parse_message(
+        raw_message: str,
+    ) -> EagleMessage:
+        """Parse one raw JSON frame received from Eagle.
+
+        fund.hello frames become EagleHello objects.
+
+        fund.heartbeat frames become EagleHeartbeat objects.
+
+        Lifecycle frames become IncomingLifecycleEvent objects.
         """
 
         if not isinstance(raw_message, str):
@@ -70,19 +174,23 @@ class EagleClient:
                 "Eagle message must decode to a JSON object."
             )
 
+        message_type = decoded_message.get("type")
+
+        if message_type == "fund.hello":
+            return EagleHello.from_dict(decoded_message)
+
+        if message_type == "fund.heartbeat":
+            return EagleHeartbeat.from_dict(decoded_message)
+
         return IncomingLifecycleEvent.from_dict(decoded_message)
 
-    async def receive_one(self) -> IncomingLifecycleEvent:
-        """Connect to Eagle and receive one lifecycle event.
-
-        This method is intentionally limited to one message for the first
-        WebSocket integration milestone. Later, a continuous receive loop,
-        reconnect logic, authentication, and heartbeat handling will be added.
-        """
+    async def receive_one(self) -> EagleMessage:
+        """Connect to Eagle and receive one validated message."""
 
         try:
             async with connect(
                 self._uri,
+                additional_headers=self._connection_headers(),
                 open_timeout=10,
                 close_timeout=10,
                 ping_interval=20,
@@ -90,6 +198,9 @@ class EagleClient:
                 max_size=1_048_576,
             ) as websocket:
                 raw_message = await websocket.recv()
+
+        except InvalidStatus as error:
+            self._raise_for_handshake_error(error)
 
         except ConnectionClosed as error:
             raise ConnectionError(
@@ -103,27 +214,16 @@ class EagleClient:
             )
 
         return self._parse_message(raw_message)
-    
-    async def listen(self) -> AsyncIterator[IncomingLifecycleEvent]:
-        """Continuously receive validated lifecycle events from Eagle.
 
-        The client maintains one WebSocket connection and yields each valid
-        lifecycle event as it arrives.
-
-        Yields:
-            Validated IncomingLifecycleEvent objects.
-
-        Raises:
-            ConnectionError:
-                If the Eagle WebSocket connection closes unexpectedly.
-
-            ValueError:
-                If Eagle sends a binary message or an invalid lifecycle event.
-        """
+    async def listen(
+        self,
+    ) -> AsyncIterator[EagleMessage]:
+        """Continuously receive validated messages from Eagle."""
 
         try:
             async with connect(
                 self._uri,
+                additional_headers=self._connection_headers(),
                 open_timeout=10,
                 close_timeout=10,
                 ping_interval=20,
@@ -138,8 +238,10 @@ class EagleClient:
 
                     yield self._parse_message(raw_message)
 
+        except InvalidStatus as error:
+            self._raise_for_handshake_error(error)
+
         except ConnectionClosed as error:
             raise ConnectionError(
                 "The Eagle WebSocket connection closed unexpectedly."
             ) from error
-    
