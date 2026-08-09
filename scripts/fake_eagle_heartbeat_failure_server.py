@@ -1,4 +1,4 @@
-"""Local fake Eagle server for heartbeat-timeout integration testing."""
+"""Fake Eagle server for silent heartbeat-failure integration testing."""
 
 import asyncio
 import json
@@ -10,12 +10,11 @@ from websockets.asyncio.server import ServerConnection, serve
 
 HOST = "localhost"
 PORT = 8765
-
 MESSAGE_DELAY_SECONDS = 2
 
-# Keep the WebSocket open long enough for BTS to detect that
+# Keep the socket open long enough for BTS to detect that
 # application-level Eagle heartbeats have stopped.
-SILENT_HOLD_SECONDS = 30
+SILENT_HOLD_SECONDS = 60
 
 
 def current_timestamp() -> str:
@@ -63,7 +62,7 @@ def create_heartbeat(
     *,
     seq: int,
 ) -> dict[str, Any]:
-    """Create a realistic Eagle fund.heartbeat control frame."""
+    """Create one Eagle fund.heartbeat control frame."""
 
     return {
         "type": "fund.heartbeat",
@@ -123,7 +122,7 @@ async def send_message(
 async def handle_client(
     websocket: ServerConnection,
 ) -> None:
-    """Send messages, then simulate silent heartbeat failure."""
+    """Send one heartbeat, then intentionally become silent."""
 
     print("BTS client connected.")
 
@@ -164,12 +163,10 @@ async def handle_client(
         print("=" * 60)
         print("SIMULATING SILENT EAGLE HEARTBEAT FAILURE")
         print("=" * 60)
+        print("The WebSocket will remain open.")
+        print("No more fund.heartbeat frames will be sent.")
         print(
-            "WebSocket remains open, but no more "
-            "fund.heartbeat frames will be sent."
-        )
-        print(
-            f"Holding connection open for "
+            f"Silent hold period: "
             f"{SILENT_HOLD_SECONDS} seconds."
         )
         print("=" * 60)
@@ -179,9 +176,8 @@ async def handle_client(
             SILENT_HOLD_SECONDS
         )
 
-        print(
-            "Silent test period completed."
-        )
+        print()
+        print("Silent test period completed.")
 
     except ConnectionError as error:
         print()
@@ -192,12 +188,13 @@ async def handle_client(
 
 
 async def main() -> None:
-    """Start the fake Eagle WebSocket server."""
+    """Start the heartbeat-failure fake Eagle server."""
 
     print("=" * 60)
     print("Fake Eagle Heartbeat Failure Server")
     print("=" * 60)
     print(f"Listening at ws://{HOST}:{PORT}")
+    print("Mode: SILENT HEARTBEAT FAILURE")
     print("Waiting for the BTS client...")
     print("Press Ctrl+C to stop the server.")
 
@@ -218,4 +215,4 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print()
-        print("Fake Eagle server stopped.")
+        print("Fake Eagle heartbeat failure server stopped.")
