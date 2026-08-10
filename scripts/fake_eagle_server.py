@@ -15,8 +15,13 @@ PORT = 8765
 MESSAGE_DELAY_SECONDS = 2
 POST_REPLAY_HOLD_SECONDS = 5
 
-SERVER_LAST_SEQ = 5
-LIVE_HEARTBEAT_SEQ = 6
+# The fake server has historical replay data through sequence 5.
+#
+# For repeated local reconnect tests, BTS may already have processed
+# later live heartbeats. The server therefore treats the client's
+# durable since_seq as part of its current sequence state and sends
+# the next live heartbeat after whichever sequence is greater.
+HISTORY_LAST_SEQ = 5
 
 
 def current_timestamp() -> str:
@@ -70,6 +75,7 @@ def get_requested_since_seq(
 def create_hello(
     *,
     since_seq: int,
+    last_seq: int,
     replay_count: int,
 ) -> dict[str, Any]:
     """Create a realistic Eagle fund.hello control frame."""
@@ -89,7 +95,7 @@ def create_hello(
             "size_mult_enabled": False,
             "pyramid_enabled": False,
         },
-        "last_seq": SERVER_LAST_SEQ,
+        "last_seq": last_seq,
         "since_seq": since_seq,
         "open_count": 0,
         "open": [],
@@ -279,8 +285,18 @@ async def handle_client(
             )
         )
 
+        current_server_last_seq = max(
+            HISTORY_LAST_SEQ,
+            requested_since_seq,
+        )
+
+        live_heartbeat_seq = (
+            current_server_last_seq + 1
+        )
+
         hello = create_hello(
             since_seq=requested_since_seq,
+            last_seq=current_server_last_seq,
             replay_count=replay_lifecycle_count,
         )
 
@@ -299,7 +315,7 @@ async def handle_client(
 
         print(
             f"Hello last_seq    : "
-            f"{SERVER_LAST_SEQ}"
+            f"{current_server_last_seq}"
         )
 
         print(
@@ -323,7 +339,7 @@ async def handle_client(
         )
 
         live_heartbeat = create_heartbeat(
-            seq=LIVE_HEARTBEAT_SEQ
+            seq=live_heartbeat_seq
         )
 
         await websocket.send(
@@ -331,7 +347,7 @@ async def handle_client(
         )
 
         print(
-            f"Sent live seq {LIVE_HEARTBEAT_SEQ}: "
+            f"Sent live seq {live_heartbeat_seq}: "
             "fund.heartbeat"
         )
 
@@ -381,6 +397,11 @@ async def main() -> None:
 
     print(
         "Mode: NORMAL / REPLAY-AWARE / HEARTBEAT-READY"
+    )
+
+    print(
+        f"Replay history through seq: "
+        f"{HISTORY_LAST_SEQ}"
     )
 
     print(

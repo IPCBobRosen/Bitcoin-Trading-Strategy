@@ -3,7 +3,8 @@
 import asyncio
 from pathlib import Path
 
-from app.broker_position_provider import StaticBrokerPositionProvider
+from app.broker_position_adapter import RawBrokerPosition
+from app.broker_position_provider import AdapterBrokerPositionProvider
 from app.communications.eagle_client import EagleClient
 from app.communications.eagle_heartbeat import EagleHeartbeat
 from app.communications.eagle_hello import EagleHello
@@ -16,6 +17,7 @@ from app.heartbeat_watchdog import HeartbeatWatchdog
 from app.reconciliation_manager import ReconciliationManager
 from app.reconnect_readiness import ReconnectReadiness
 from app.replay_tracker import ReplayTracker
+from app.resume_manager import ResumeManager
 from app.trade_coordinator import TradeCoordinator
 from app.trading_controls import TradingControls
 
@@ -27,6 +29,28 @@ DATABASE_PATH = Path("data") / "local_eagle_events.db"
 HEARTBEAT_TIMEOUT_SECONDS = 45
 WATCHDOG_CHECK_INTERVAL_SECONDS = 1.0
 INITIAL_HEARTBEAT_TIMEOUT_SECONDS = 45.0
+
+# Explicit integration-test switch.
+#
+# This is NOT production automatic resume behavior.
+# When True, the local runner deliberately makes:
+#
+# 1. one resume request before heartbeat readiness, which must fail;
+# 2. one resume request after full reconnect readiness, which may succeed.
+LOCAL_MANUAL_RESUME_TEST = True
+
+
+def get_local_raw_broker_positions() -> list[RawBrokerPosition]:
+    """Return the raw broker snapshot used by local integration tests.
+
+    The fake Eagle server currently announces no open positions,
+    so the matching local broker snapshot is also empty.
+
+    This function represents the boundary where a real broker API
+    position query can be connected later.
+    """
+
+    return []
 
 
 async def main() -> None:
@@ -62,12 +86,21 @@ async def main() -> None:
 
     reconciliation_manager = ReconciliationManager()
 
-    broker_position_provider = StaticBrokerPositionProvider()
+    broker_position_provider = (
+        AdapterBrokerPositionProvider(
+            get_local_raw_broker_positions
+        )
+    )
 
     reconnect_readiness = ReconnectReadiness(
         replay_tracker,
         reconciliation_manager,
         health,
+    )
+
+    resume_manager = ResumeManager(
+        controls,
+        reconnect_readiness,
     )
 
     watchdog = HeartbeatWatchdog(
@@ -103,6 +136,11 @@ async def main() -> None:
         f"{health.heartbeat_timeout_seconds} seconds"
     )
 
+    print(
+        f"Manual resume test: "
+        f"{LOCAL_MANUAL_RESUME_TEST}"
+    )
+
     print()
     print("Connecting to fake Eagle server...")
     print("Listening for Eagle messages...")
@@ -114,10 +152,15 @@ async def main() -> None:
     heartbeat_count = 0
     hello_count = 0
 
+    pre_heartbeat_resume_attempted = False
+    ready_resume_attempted = False
+
     def print_reconnect_readiness() -> None:
         """Display the current reconnect safety decision."""
 
-        readiness_result = reconnect_readiness.evaluate()
+        readiness_result = (
+            reconnect_readiness.evaluate()
+        )
 
         print()
         print("Reconnect readiness:")
@@ -137,6 +180,48 @@ async def main() -> None:
             f"{readiness_result.reason}"
         )
 
+    def print_resume_result(
+        *,
+        stage: str,
+    ) -> bool:
+        """Make and display one explicit local resume request."""
+
+        result = resume_manager.request_resume()
+
+        print()
+        print("=" * 60)
+
+        print(
+            f"LOCAL MANUAL RESUME TEST - {stage}"
+        )
+
+        print("=" * 60)
+
+        print(
+            f"Resume status : "
+            f"{result.status.value}"
+        )
+
+        print(
+            f"Resumed       : "
+            f"{result.resumed}"
+        )
+
+        print(
+            f"Reason        : "
+            f"{result.reason}"
+        )
+
+        print(
+            f"Trading paused: "
+            f"{controls.is_paused}"
+        )
+
+        print("=" * 60)
+        print()
+
+        return result.resumed
+
     async def process_eagle_messages() -> None:
         """Receive and route validated messages from Eagle."""
 
@@ -144,13 +229,18 @@ async def main() -> None:
         nonlocal lifecycle_count
         nonlocal heartbeat_count
         nonlocal hello_count
+        nonlocal pre_heartbeat_resume_attempted
+        nonlocal ready_resume_attempted
 
         async for message in client.listen():
             message_count += 1
 
             print("-" * 60)
 
-            if isinstance(message, EagleHello):
+            if isinstance(
+                message,
+                EagleHello,
+            ):
                 hello_count += 1
 
                 replay_tracker.process_hello(
@@ -163,8 +253,12 @@ async def main() -> None:
 
                 reconciliation_result = (
                     reconciliation_manager.reconcile(
-                        eagle_positions=message.open_positions,
-                        broker_positions=broker_positions,
+                        eagle_positions=(
+                            message.open_positions
+                        ),
+                        broker_positions=(
+                            broker_positions
+                        ),
                     )
                 )
 
@@ -222,7 +316,9 @@ async def main() -> None:
                 )
 
                 print()
-                print("Open-position reconciliation:")
+                print(
+                    "Open-position reconciliation:"
+                )
 
                 print(
                     f"Eagle positions : "
@@ -257,8 +353,10 @@ async def main() -> None:
 
                 if replay_tracker.replay_complete:
                     print()
+
                     print(
-                        "Eagle announced no lifecycle replay events."
+                        "Eagle announced no lifecycle "
+                        "replay events."
                     )
 
                     print(
@@ -266,6 +364,16 @@ async def main() -> None:
                     )
 
                 print_reconnect_readiness()
+
+                if (
+                    LOCAL_MANUAL_RESUME_TEST
+                    and not pre_heartbeat_resume_attempted
+                ):
+                    pre_heartbeat_resume_attempted = True
+
+                    print_resume_result(
+                        stage="BEFORE HEARTBEAT",
+                    )
 
                 print()
                 continue
@@ -327,6 +435,21 @@ async def main() -> None:
                 )
 
                 print_reconnect_readiness()
+
+                readiness_result = (
+                    reconnect_readiness.evaluate()
+                )
+
+                if (
+                    LOCAL_MANUAL_RESUME_TEST
+                    and readiness_result.ready
+                    and not ready_resume_attempted
+                ):
+                    ready_resume_attempted = True
+
+                    print_resume_result(
+                        stage="AFTER READY",
+                    )
 
                 print()
                 continue
@@ -414,7 +537,10 @@ async def main() -> None:
                     is not None
                 ):
                     print()
-                    print("TradeRequest created:")
+
+                    print(
+                        "TradeRequest created:"
+                    )
 
                     print(
                         decision.trade_request
@@ -536,7 +662,9 @@ async def main() -> None:
             except asyncio.CancelledError:
                 pass
 
-    final_readiness = reconnect_readiness.evaluate()
+    final_readiness = (
+        reconnect_readiness.evaluate()
+    )
 
     print("-" * 60)
 
@@ -591,6 +719,21 @@ async def main() -> None:
     )
 
     print(
+        f"Resume test mode : "
+        f"{LOCAL_MANUAL_RESUME_TEST}"
+    )
+
+    print(
+        f"Pre-HB attempt   : "
+        f"{pre_heartbeat_resume_attempted}"
+    )
+
+    print(
+        f"Ready attempt    : "
+        f"{ready_resume_attempted}"
+    )
+
+    print(
         f"Last durable seq : "
         f"{event_store.get_last_seq()}"
     )
@@ -603,11 +746,16 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(
+            main()
+        )
 
     except ConnectionRefusedError:
         print()
-        print("Connection failed.")
+
+        print(
+            "Connection failed."
+        )
 
         print(
             "Start the fake Eagle server first."
@@ -629,4 +777,7 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print()
-        print("BTS client stopped.")
+
+        print(
+            "BTS client stopped."
+        )
