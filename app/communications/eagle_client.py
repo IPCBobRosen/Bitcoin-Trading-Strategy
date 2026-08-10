@@ -3,6 +3,12 @@
 import json
 from collections.abc import AsyncIterator
 from typing import Any
+from urllib.parse import (
+    parse_qsl,
+    urlencode,
+    urlsplit,
+    urlunsplit,
+)
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -42,6 +48,7 @@ class EagleClient:
         self,
         uri: str,
         api_key: str | None = None,
+        since_seq: int | None = None,
     ) -> None:
         """Create an Eagle WebSocket client.
 
@@ -55,6 +62,13 @@ class EagleClient:
 
                 When supplied, BTS sends the key in the ``x-api-key``
                 HTTP header during the WebSocket opening handshake.
+
+            since_seq:
+                Optional durable Eagle sequence cursor.
+
+                When supplied, BTS adds ``since_seq`` to the WebSocket
+                connection URL so Eagle can replay events newer than the
+                durable BTS cursor.
         """
 
         if not isinstance(uri, str) or not uri.strip():
@@ -68,20 +82,80 @@ class EagleClient:
 
             api_key = api_key.strip()
 
+        if since_seq is not None:
+            if (
+                not isinstance(since_seq, int)
+                or isinstance(since_seq, bool)
+                or since_seq < 0
+            ):
+                raise ValueError(
+                    "'since_seq' must be a non-negative integer "
+                    "when supplied."
+                )
+
         self._uri = uri.strip()
         self._api_key = api_key
+        self._since_seq = since_seq
 
     @property
     def uri(self) -> str:
-        """Return the configured Eagle WebSocket address."""
+        """Return the configured base Eagle WebSocket address."""
 
         return self._uri
+
+    @property
+    def since_seq(self) -> int | None:
+        """Return the configured Eagle replay cursor."""
+
+        return self._since_seq
 
     @property
     def has_api_key(self) -> bool:
         """Return True when an Eagle API key is configured."""
 
         return self._api_key is not None
+
+    def _connection_uri(self) -> str:
+        """Return the WebSocket URI including the optional replay cursor."""
+
+        if self._since_seq is None:
+            return self._uri
+
+        parsed_uri = urlsplit(
+            self._uri
+        )
+
+        query_items = parse_qsl(
+            parsed_uri.query,
+            keep_blank_values=True,
+        )
+
+        query_items = [
+            (key, value)
+            for key, value in query_items
+            if key != "since_seq"
+        ]
+
+        query_items.append(
+            (
+                "since_seq",
+                str(self._since_seq),
+            )
+        )
+
+        updated_query = urlencode(
+            query_items
+        )
+
+        return urlunsplit(
+            (
+                parsed_uri.scheme,
+                parsed_uri.netloc,
+                parsed_uri.path,
+                updated_query,
+                parsed_uri.fragment,
+            )
+        )
 
     def _connection_headers(self) -> dict[str, str] | None:
         """Create authentication headers for the WebSocket handshake."""
@@ -102,6 +176,7 @@ class EagleClient:
 
         try:
             retry_after = int(value)
+
         except ValueError:
             return None
 
@@ -160,10 +235,15 @@ class EagleClient:
         """
 
         if not isinstance(raw_message, str):
-            raise TypeError("'raw_message' must be a string.")
+            raise TypeError(
+                "'raw_message' must be a string."
+            )
 
         try:
-            decoded_message: Any = json.loads(raw_message)
+            decoded_message: Any = json.loads(
+                raw_message
+            )
+
         except json.JSONDecodeError as error:
             raise ValueError(
                 "Eagle message must contain valid JSON."
@@ -174,22 +254,30 @@ class EagleClient:
                 "Eagle message must decode to a JSON object."
             )
 
-        message_type = decoded_message.get("type")
+        message_type = decoded_message.get(
+            "type"
+        )
 
         if message_type == "fund.hello":
-            return EagleHello.from_dict(decoded_message)
+            return EagleHello.from_dict(
+                decoded_message
+            )
 
         if message_type == "fund.heartbeat":
-            return EagleHeartbeat.from_dict(decoded_message)
+            return EagleHeartbeat.from_dict(
+                decoded_message
+            )
 
-        return IncomingLifecycleEvent.from_dict(decoded_message)
+        return IncomingLifecycleEvent.from_dict(
+            decoded_message
+        )
 
     async def receive_one(self) -> EagleMessage:
         """Connect to Eagle and receive one validated message."""
 
         try:
             async with connect(
-                self._uri,
+                self._connection_uri(),
                 additional_headers=self._connection_headers(),
                 open_timeout=10,
                 close_timeout=10,
@@ -200,7 +288,9 @@ class EagleClient:
                 raw_message = await websocket.recv()
 
         except InvalidStatus as error:
-            self._raise_for_handshake_error(error)
+            self._raise_for_handshake_error(
+                error
+            )
 
         except ConnectionClosed as error:
             raise ConnectionError(
@@ -213,7 +303,9 @@ class EagleClient:
                 "Eagle must send JSON as a WebSocket text message."
             )
 
-        return self._parse_message(raw_message)
+        return self._parse_message(
+            raw_message
+        )
 
     async def listen(
         self,
@@ -222,7 +314,7 @@ class EagleClient:
 
         try:
             async with connect(
-                self._uri,
+                self._connection_uri(),
                 additional_headers=self._connection_headers(),
                 open_timeout=10,
                 close_timeout=10,
@@ -231,15 +323,23 @@ class EagleClient:
                 max_size=1_048_576,
             ) as websocket:
                 async for raw_message in websocket:
-                    if not isinstance(raw_message, str):
+                    if not isinstance(
+                        raw_message,
+                        str,
+                    ):
                         raise ValueError(
-                            "Eagle must send JSON as a WebSocket text message."
+                            "Eagle must send JSON as a "
+                            "WebSocket text message."
                         )
 
-                    yield self._parse_message(raw_message)
+                    yield self._parse_message(
+                        raw_message
+                    )
 
         except InvalidStatus as error:
-            self._raise_for_handshake_error(error)
+            self._raise_for_handshake_error(
+                error
+            )
 
         except ConnectionClosed as error:
             raise ConnectionError(

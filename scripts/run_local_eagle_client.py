@@ -12,6 +12,7 @@ from app.event_processor import EventProcessStatus, EventProcessor
 from app.event_store import EventStore
 from app.heartbeat_processor import HeartbeatProcessor
 from app.heartbeat_watchdog import HeartbeatWatchdog
+from app.replay_tracker import ReplayTracker
 from app.trade_coordinator import TradeCoordinator
 from app.trading_controls import TradingControls
 
@@ -50,6 +51,8 @@ async def main() -> None:
         event_store
     )
 
+    replay_tracker = ReplayTracker()
+
     health = ConnectionHealth(
         heartbeat_timeout_seconds=HEARTBEAT_TIMEOUT_SECONDS
     )
@@ -66,8 +69,11 @@ async def main() -> None:
         controls
     )
 
+    last_durable_seq = event_store.get_last_seq()
+
     client = EagleClient(
-        EAGLE_URI
+        EAGLE_URI,
+        since_seq=last_durable_seq,
     )
 
     print(f"Eagle address    : {EAGLE_URI}")
@@ -76,7 +82,8 @@ async def main() -> None:
     print(f"Quantity         : {controls.quantity}")
     print(f"Stop loss        : {controls.stop_loss_points}")
     print(f"Event database   : {DATABASE_PATH}")
-    print(f"Last durable seq : {event_store.get_last_seq()}")
+    print(f"Last durable seq : {last_durable_seq}")
+    print(f"Reconnect cursor : {last_durable_seq}")
 
     print(
         f"Heartbeat timeout: "
@@ -109,6 +116,10 @@ async def main() -> None:
 
             if isinstance(message, EagleHello):
                 hello_count += 1
+
+                replay_tracker.process_hello(
+                    message
+                )
 
                 print(
                     f"Eagle hello #{hello_count} "
@@ -146,10 +157,37 @@ async def main() -> None:
                 )
 
                 print()
+                print("Replay tracking:")
+
+                print(
+                    f"Expected replay : "
+                    f"{replay_tracker.expected_replay_count}"
+                )
+
+                print(
+                    f"Processed replay: "
+                    f"{replay_tracker.processed_replay_count}"
+                )
+
+                print(
+                    f"Replay complete : "
+                    f"{replay_tracker.replay_complete}"
+                )
+
+                print()
                 print(
                     "fund.hello is a control frame. "
                     "No TradeRequest will be created."
                 )
+
+                if replay_tracker.replay_complete:
+                    print()
+                    print(
+                        "Eagle announced no lifecycle replay events."
+                    )
+                    print(
+                        "Replay phase is COMPLETE."
+                    )
 
                 print()
                 continue
@@ -196,8 +234,18 @@ async def main() -> None:
                 )
 
                 print(
+                    "Replay progress:",
+                    (
+                        f"{replay_tracker.processed_replay_count}"
+                        f"/"
+                        f"{replay_tracker.expected_replay_count}"
+                    ),
+                )
+
+                print(
                     "Heartbeat is a control frame. "
-                    "No TradeRequest will be created."
+                    "It does not count as a replay lifecycle event "
+                    "and no TradeRequest will be created."
                 )
 
                 print()
@@ -216,6 +264,30 @@ async def main() -> None:
                 )
 
                 print(message)
+
+                replay_was_complete = (
+                    replay_tracker.replay_complete
+                )
+
+                replay_tracker.record_lifecycle_event(
+                    message
+                )
+
+                if not replay_was_complete:
+                    print()
+                    print(
+                        "Replay lifecycle progress:",
+                        (
+                            f"{replay_tracker.processed_replay_count}"
+                            f"/"
+                            f"{replay_tracker.expected_replay_count}"
+                        ),
+                    )
+
+                    if replay_tracker.replay_complete:
+                        print(
+                            "Replay phase is COMPLETE."
+                        )
 
                 process_result = (
                     event_processor.process(
@@ -354,8 +426,6 @@ async def main() -> None:
     if watchdog_task in done_tasks:
         await watchdog_task
 
-        # The watchdog finishing first means Eagle heartbeat continuity
-        # was lost. The runtime explicitly reports the safety condition.
         controls.pause()
 
         print_heartbeat_timeout_warning()
@@ -401,6 +471,21 @@ async def main() -> None:
     print(
         f"Lifecycle events : "
         f"{lifecycle_count}"
+    )
+
+    print(
+        f"Replay expected  : "
+        f"{replay_tracker.expected_replay_count}"
+    )
+
+    print(
+        f"Replay processed : "
+        f"{replay_tracker.processed_replay_count}"
+    )
+
+    print(
+        f"Replay complete  : "
+        f"{replay_tracker.replay_complete}"
     )
 
     print(
