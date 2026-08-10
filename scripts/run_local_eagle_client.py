@@ -3,6 +3,7 @@
 import asyncio
 from pathlib import Path
 
+from app.broker_position_provider import StaticBrokerPositionProvider
 from app.communications.eagle_client import EagleClient
 from app.communications.eagle_heartbeat import EagleHeartbeat
 from app.communications.eagle_hello import EagleHello
@@ -12,6 +13,8 @@ from app.event_processor import EventProcessStatus, EventProcessor
 from app.event_store import EventStore
 from app.heartbeat_processor import HeartbeatProcessor
 from app.heartbeat_watchdog import HeartbeatWatchdog
+from app.reconciliation_manager import ReconciliationManager
+from app.reconnect_readiness import ReconnectReadiness
 from app.replay_tracker import ReplayTracker
 from app.trade_coordinator import TradeCoordinator
 from app.trading_controls import TradingControls
@@ -27,7 +30,7 @@ INITIAL_HEARTBEAT_TIMEOUT_SECONDS = 45.0
 
 
 async def main() -> None:
-    """Receive Eagle messages while monitoring connection health."""
+    """Receive Eagle messages while monitoring reconnect safety."""
 
     print("=" * 60)
     print("Bitcoin Trading System - Local Eagle Client Test")
@@ -55,6 +58,16 @@ async def main() -> None:
 
     health = ConnectionHealth(
         heartbeat_timeout_seconds=HEARTBEAT_TIMEOUT_SECONDS
+    )
+
+    reconciliation_manager = ReconciliationManager()
+
+    broker_position_provider = StaticBrokerPositionProvider()
+
+    reconnect_readiness = ReconnectReadiness(
+        replay_tracker,
+        reconciliation_manager,
+        health,
     )
 
     watchdog = HeartbeatWatchdog(
@@ -101,8 +114,31 @@ async def main() -> None:
     heartbeat_count = 0
     hello_count = 0
 
+    def print_reconnect_readiness() -> None:
+        """Display the current reconnect safety decision."""
+
+        readiness_result = reconnect_readiness.evaluate()
+
+        print()
+        print("Reconnect readiness:")
+
+        print(
+            f"Status : "
+            f"{readiness_result.status.value}"
+        )
+
+        print(
+            f"Ready  : "
+            f"{readiness_result.ready}"
+        )
+
+        print(
+            f"Reason : "
+            f"{readiness_result.reason}"
+        )
+
     async def process_eagle_messages() -> None:
-        """Receive and route messages from Eagle."""
+        """Receive and route validated messages from Eagle."""
 
         nonlocal message_count
         nonlocal lifecycle_count
@@ -119,6 +155,17 @@ async def main() -> None:
 
                 replay_tracker.process_hello(
                     message
+                )
+
+                broker_positions = (
+                    broker_position_provider.get_positions()
+                )
+
+                reconciliation_result = (
+                    reconciliation_manager.reconcile(
+                        eagle_positions=message.open_positions,
+                        broker_positions=broker_positions,
+                    )
                 )
 
                 print(
@@ -175,6 +222,34 @@ async def main() -> None:
                 )
 
                 print()
+                print("Open-position reconciliation:")
+
+                print(
+                    f"Eagle positions : "
+                    f"{len(message.open_positions)}"
+                )
+
+                print(
+                    f"Broker positions: "
+                    f"{len(broker_positions)}"
+                )
+
+                print(
+                    f"Status          : "
+                    f"{reconciliation_result.status.value}"
+                )
+
+                print(
+                    f"Matched         : "
+                    f"{reconciliation_result.matched}"
+                )
+
+                print(
+                    f"Reason          : "
+                    f"{reconciliation_result.reason}"
+                )
+
+                print()
                 print(
                     "fund.hello is a control frame. "
                     "No TradeRequest will be created."
@@ -185,9 +260,12 @@ async def main() -> None:
                     print(
                         "Eagle announced no lifecycle replay events."
                     )
+
                     print(
                         "Replay phase is COMPLETE."
                     )
+
+                print_reconnect_readiness()
 
                 print()
                 continue
@@ -248,6 +326,8 @@ async def main() -> None:
                     "and no TradeRequest will be created."
                 )
 
+                print_reconnect_readiness()
+
                 print()
                 continue
 
@@ -275,6 +355,7 @@ async def main() -> None:
 
                 if not replay_was_complete:
                     print()
+
                     print(
                         "Replay lifecycle progress:",
                         (
@@ -288,6 +369,8 @@ async def main() -> None:
                         print(
                             "Replay phase is COMPLETE."
                         )
+
+                print_reconnect_readiness()
 
                 process_result = (
                     event_processor.process(
@@ -332,12 +415,14 @@ async def main() -> None:
                 ):
                     print()
                     print("TradeRequest created:")
+
                     print(
                         decision.trade_request
                     )
 
                 else:
                     print()
+
                     print(
                         "No TradeRequest was created."
                     )
@@ -451,6 +536,8 @@ async def main() -> None:
             except asyncio.CancelledError:
                 pass
 
+    final_readiness = reconnect_readiness.evaluate()
+
     print("-" * 60)
 
     print(
@@ -489,6 +576,21 @@ async def main() -> None:
     )
 
     print(
+        f"Reconciliation   : "
+        f"{reconciliation_manager.last_result.status.value}"
+    )
+
+    print(
+        f"Reconnect ready  : "
+        f"{final_readiness.ready}"
+    )
+
+    print(
+        f"Readiness reason : "
+        f"{final_readiness.reason}"
+    )
+
+    print(
         f"Last durable seq : "
         f"{event_store.get_last_seq()}"
     )
@@ -506,18 +608,21 @@ if __name__ == "__main__":
     except ConnectionRefusedError:
         print()
         print("Connection failed.")
+
         print(
             "Start the fake Eagle server first."
         )
 
     except ConnectionError as error:
         print()
+
         print(
             f"Connection error: {error}"
         )
 
     except ValueError as error:
         print()
+
         print(
             f"Invalid Eagle message: {error}"
         )

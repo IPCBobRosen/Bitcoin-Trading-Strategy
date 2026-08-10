@@ -11,8 +11,12 @@ from websockets.asyncio.server import ServerConnection, serve
 
 HOST = "localhost"
 PORT = 8765
+
 MESSAGE_DELAY_SECONDS = 2
+POST_REPLAY_HOLD_SECONDS = 5
+
 SERVER_LAST_SEQ = 5
+LIVE_HEARTBEAT_SEQ = 6
 
 
 def current_timestamp() -> str:
@@ -146,7 +150,7 @@ def create_lifecycle_event(
 
 
 def create_test_messages() -> list[dict[str, Any]]:
-    """Create the server's complete ordered Eagle message history."""
+    """Create the server's complete ordered replay history."""
 
     return [
         create_lifecycle_event(
@@ -240,7 +244,7 @@ async def send_message(
 async def handle_client(
     websocket: ServerConnection,
 ) -> None:
-    """Send hello followed by messages newer than since_seq."""
+    """Send hello, replay, then a fresh live heartbeat."""
 
     print("BTS client connected.")
 
@@ -315,7 +319,34 @@ async def handle_client(
 
         print()
         print(
-            "All requested Eagle messages sent."
+            "Replay delivery complete."
+        )
+
+        live_heartbeat = create_heartbeat(
+            seq=LIVE_HEARTBEAT_SEQ
+        )
+
+        await websocket.send(
+            json.dumps(live_heartbeat)
+        )
+
+        print(
+            f"Sent live seq {LIVE_HEARTBEAT_SEQ}: "
+            "fund.heartbeat"
+        )
+
+        print(
+            "Holding connection open briefly "
+            "after live heartbeat."
+        )
+
+        await asyncio.sleep(
+            POST_REPLAY_HOLD_SECONDS
+        )
+
+        print()
+        print(
+            "Normal integration session completed."
         )
 
         print(
@@ -349,7 +380,7 @@ async def main() -> None:
     )
 
     print(
-        "Mode: NORMAL / REPLAY-AWARE"
+        "Mode: NORMAL / REPLAY-AWARE / HEARTBEAT-READY"
     )
 
     print(

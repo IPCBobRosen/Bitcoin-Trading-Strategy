@@ -2,6 +2,7 @@
 
 import pytest
 
+from app.broker_position import BrokerPosition
 from app.reconciliation_manager import (
     ReconciliationManager,
     ReconciliationStatus,
@@ -111,6 +112,143 @@ def test_position_order_does_not_matter() -> None:
     assert result.matched is True
 
 
+def test_broker_position_object_matches_eagle_dictionary() -> None:
+    """A normalized BrokerPosition should reconcile with Eagle data."""
+
+    manager = ReconciliationManager()
+
+    eagle_positions = [
+        {
+            "signal_id": "signal-001",
+            "symbol": "MBT",
+            "side": "LONG",
+            "quantity": 2,
+        }
+    ]
+
+    broker_positions = [
+        BrokerPosition(
+            symbol="MBT",
+            side="LONG",
+            quantity=2,
+            signal_id="signal-001",
+        )
+    ]
+
+    result = manager.reconcile(
+        eagle_positions=eagle_positions,
+        broker_positions=broker_positions,
+    )
+
+    assert result.status is ReconciliationStatus.MATCHED
+    assert result.matched is True
+
+
+def test_broker_position_object_is_normalized_in_result() -> None:
+    """Results should contain dictionaries rather than broker objects."""
+
+    manager = ReconciliationManager()
+
+    result = manager.reconcile(
+        eagle_positions=[
+            {
+                "signal_id": "signal-001",
+                "symbol": "MBT",
+                "side": "SHORT",
+                "quantity": 1,
+            }
+        ],
+        broker_positions=[
+            BrokerPosition(
+                symbol="MBT",
+                side="SHORT",
+                quantity=1,
+                signal_id="signal-001",
+            )
+        ],
+    )
+
+    assert result.broker_positions == (
+        {
+            "symbol": "MBT",
+            "side": "SHORT",
+            "quantity": 1,
+            "signal_id": "signal-001",
+        },
+    )
+
+
+def test_broker_position_mismatch_is_detected() -> None:
+    """BrokerPosition differences must still fail reconciliation."""
+
+    manager = ReconciliationManager()
+
+    result = manager.reconcile(
+        eagle_positions=[
+            {
+                "signal_id": "signal-001",
+                "symbol": "MBT",
+                "side": "LONG",
+                "quantity": 1,
+            }
+        ],
+        broker_positions=[
+            BrokerPosition(
+                symbol="MBT",
+                side="LONG",
+                quantity=2,
+                signal_id="signal-001",
+            )
+        ],
+    )
+
+    assert result.status is ReconciliationStatus.MISMATCHED
+    assert result.matched is False
+
+
+def test_mixed_broker_position_types_are_supported() -> None:
+    """Broker dictionaries and BrokerPosition objects may coexist."""
+
+    manager = ReconciliationManager()
+
+    eagle_positions = [
+        {
+            "signal_id": "signal-001",
+            "symbol": "MBT",
+            "side": "LONG",
+            "quantity": 1,
+        },
+        {
+            "signal_id": "signal-002",
+            "symbol": "MBT",
+            "side": "SHORT",
+            "quantity": 2,
+        },
+    ]
+
+    broker_positions = [
+        BrokerPosition(
+            symbol="MBT",
+            side="LONG",
+            quantity=1,
+            signal_id="signal-001",
+        ),
+        {
+            "signal_id": "signal-002",
+            "symbol": "MBT",
+            "side": "SHORT",
+            "quantity": 2,
+        },
+    ]
+
+    result = manager.reconcile(
+        eagle_positions=eagle_positions,
+        broker_positions=broker_positions,
+    )
+
+    assert result.status is ReconciliationStatus.MATCHED
+
+
 def test_different_quantity_is_mismatch() -> None:
     """Different position quantities must fail reconciliation."""
 
@@ -209,8 +347,8 @@ def test_invalid_broker_positions_type_is_rejected() -> None:
         )
 
 
-def test_invalid_position_entry_is_rejected() -> None:
-    """Every position entry must be a dictionary."""
+def test_invalid_eagle_position_entry_is_rejected() -> None:
+    """Every Eagle position entry must be a dictionary."""
 
     manager = ReconciliationManager()
 
@@ -223,6 +361,26 @@ def test_invalid_position_entry_is_rejected() -> None:
                 "invalid"
             ],  # type: ignore[list-item]
             broker_positions=[],
+        )
+
+
+def test_invalid_broker_position_entry_is_rejected() -> None:
+    """Broker entries must use supported normalized position types."""
+
+    manager = ReconciliationManager()
+
+    with pytest.raises(
+        TypeError,
+        match=(
+            "'broker_positions' must contain only dictionaries "
+            "or BrokerPosition objects"
+        ),
+    ):
+        manager.reconcile(
+            eagle_positions=[],
+            broker_positions=[
+                "invalid"
+            ],  # type: ignore[list-item]
         )
 
 
