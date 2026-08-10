@@ -3,7 +3,7 @@
 import asyncio
 from pathlib import Path
 
-from app.broker_position_adapter import RawBrokerPosition
+from app.broker_client import FakeBrokerClient
 from app.broker_position_provider import AdapterBrokerPositionProvider
 from app.communications.eagle_client import EagleClient
 from app.communications.eagle_heartbeat import EagleHeartbeat
@@ -40,19 +40,6 @@ INITIAL_HEARTBEAT_TIMEOUT_SECONDS = 45.0
 LOCAL_MANUAL_RESUME_TEST = True
 
 
-def get_local_raw_broker_positions() -> list[RawBrokerPosition]:
-    """Return the raw broker snapshot used by local integration tests.
-
-    The fake Eagle server currently announces no open positions,
-    so the matching local broker snapshot is also empty.
-
-    This function represents the boundary where a real broker API
-    position query can be connected later.
-    """
-
-    return []
-
-
 async def main() -> None:
     """Receive Eagle messages while monitoring reconnect safety."""
 
@@ -86,9 +73,11 @@ async def main() -> None:
 
     reconciliation_manager = ReconciliationManager()
 
+    broker_client = FakeBrokerClient()
+
     broker_position_provider = (
         AdapterBrokerPositionProvider(
-            get_local_raw_broker_positions
+            broker_client.get_raw_positions
         )
     )
 
@@ -139,6 +128,10 @@ async def main() -> None:
     print(
         f"Manual resume test: "
         f"{LOCAL_MANUAL_RESUME_TEST}"
+    )
+
+    print(
+        "Broker client    : FakeBrokerClient"
     )
 
     print()
