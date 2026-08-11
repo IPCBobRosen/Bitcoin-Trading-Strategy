@@ -33,7 +33,11 @@ from app.ib_order_id_allocator import IBOrderIdAllocator
 from app.ib_order_status_transport import (
     IBOrderStatusTransport,
 )
-
+from app.ib_error_handler import (
+    IBErrorHandler,
+    IBErrorSeverity,
+)
+from app.kill_switch import KillSwitch
 
 def create_contract(
     *,
@@ -1124,3 +1128,325 @@ def test_empty_local_symbol_falls_back_to_root_symbol() -> None:
         broker_client.get_raw_positions()[0].symbol
         == "MBT"
     )
+
+    def test_app_creates_kill_switch_by_default() -> None:
+     """Every IB application should own emergency protection."""
+
+    app = IBApiPositionApp(
+        IBBrokerClient()
+    )
+
+    assert isinstance(
+        app.kill_switch,
+        KillSwitch,
+    )
+
+
+def test_supplied_kill_switch_is_retained() -> None:
+    """App should use the supplied system kill switch."""
+
+    kill_switch = KillSwitch()
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        kill_switch=kill_switch,
+    )
+
+    assert app.kill_switch is kill_switch
+
+
+def test_invalid_kill_switch_is_rejected() -> None:
+    """Constructor requires KillSwitch or None."""
+
+    with pytest.raises(
+        TypeError,
+        match="'kill_switch'",
+    ):
+        IBApiPositionApp(
+            IBBrokerClient(),
+            kill_switch=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_app_without_ledger_has_no_error_handler() -> None:
+    """Position-only mode should not create ledger error handling."""
+
+    app = IBApiPositionApp(
+        IBBrokerClient()
+    )
+
+    assert app.error_handler is None
+
+
+def test_app_with_ledger_creates_error_handler(
+    tmp_path,
+) -> None:
+    """Execution-enabled app should create IB error handler."""
+
+    ledger = ExecutionLedger(
+        tmp_path
+        / "execution_ledger.db"
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    assert isinstance(
+        app.error_handler,
+        IBErrorHandler,
+    )
+
+    assert (
+        app.error_handler.kill_switch
+        is app.kill_switch
+    )
+
+
+def test_new_app_has_no_last_error_result(
+    tmp_path,
+) -> None:
+    """No IB error classification should exist initially."""
+
+    ledger = ExecutionLedger(
+        tmp_path
+        / "execution_ledger.db"
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    assert app.last_error_result is None
+
+
+def test_information_error_callback_does_not_trip_kill_switch(
+    tmp_path,
+) -> None:
+    """Normal IB connectivity notification should remain harmless."""
+
+    ledger = ExecutionLedger(
+        tmp_path
+        / "execution_ledger.db"
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    app.error(
+        reqId=-1,
+        errorTime=1770000000,
+        errorCode=2104,
+        errorString="Market data farm connection is OK.",
+    )
+
+    assert app.last_error_result is not None
+
+    assert (
+        app.last_error_result.severity
+        is IBErrorSeverity.INFORMATION
+    )
+
+    assert app.kill_switch.active is False
+
+
+def test_connection_loss_error_trips_kill_switch(
+    tmp_path,
+) -> None:
+    """IB 1100 callback should block BTS trading."""
+
+    ledger = ExecutionLedger(
+        tmp_path
+        / "execution_ledger.db"
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    app.error(
+        reqId=-1,
+        errorTime=1770000000,
+        errorCode=1100,
+        errorString="Connectivity between IB and TWS lost.",
+    )
+
+    assert app.last_error_result is not None
+
+    assert (
+        app.last_error_result.severity
+        is IBErrorSeverity.CONNECTION_LOST
+    )
+
+    assert app.kill_switch.active is True
+
+
+def test_connection_restoration_does_not_reset_kill_switch(
+    tmp_path,
+) -> None:
+    """Restored IB connectivity must not silently resume trading."""
+
+    ledger = ExecutionLedger(
+        tmp_path
+        / "execution_ledger.db"
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    app.error(
+        reqId=-1,
+        errorTime=1770000000,
+        errorCode=1100,
+        errorString="Connectivity lost.",
+    )
+
+    assert app.kill_switch.active is True
+
+    app.error(
+        reqId=-1,
+        errorTime=1770000001,
+        errorCode=1102,
+        errorString="Connectivity restored.",
+    )
+
+    assert app.last_error_result is not None
+
+    assert (
+        app.last_error_result.severity
+        is IBErrorSeverity.CONNECTION_RESTORED
+    )
+
+    assert app.kill_switch.active is True
+
+
+def test_known_order_rejection_flows_through_error_callback(
+    tmp_path,
+) -> None:
+    """Official IB 201 should reject the corresponding BTS order."""
+
+    ledger = create_submitted_ledger(
+        tmp_path,
+        broker_order_id=100,
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    app.error(
+        reqId=100,
+        errorTime=1770000000,
+        errorCode=201,
+        errorString="Order rejected.",
+    )
+
+    record = ledger.get(
+        "event-001"
+    )
+
+    assert record is not None
+
+    assert (
+        record.status
+        is ExecutionStatus.REJECTED
+    )
+
+
+def test_known_order_cancellation_flows_through_error_callback(
+    tmp_path,
+) -> None:
+    """Official IB 202 should cancel corresponding BTS order."""
+
+    ledger = create_submitted_ledger(
+        tmp_path,
+        broker_order_id=100,
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    app.error(
+        reqId=100,
+        errorTime=1770000000,
+        errorCode=202,
+        errorString="Order cancelled.",
+    )
+
+    record = ledger.get(
+        "event-001"
+    )
+
+    assert record is not None
+
+    assert (
+        record.status
+        is ExecutionStatus.CANCELLED
+    )
+
+
+def test_advanced_order_reject_json_is_preserved(
+    tmp_path,
+) -> None:
+    """Advanced IB rejection detail should reach the audit record."""
+
+    ledger = create_submitted_ledger(
+        tmp_path,
+        broker_order_id=100,
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    app.error(
+        reqId=100,
+        errorTime=1770000000,
+        errorCode=201,
+        errorString="Order rejected.",
+        advancedOrderRejectJson=(
+            '{"error":"paper rejection detail"}'
+        ),
+    )
+
+    record = ledger.get(
+        "event-001"
+    )
+
+    assert record is not None
+    assert record.reason is not None
+
+    assert (
+        "paper rejection detail"
+        in record.reason
+    )
+
+
+def test_error_without_execution_ledger_is_safe() -> None:
+    """Position-only app should tolerate incoming IB notifications."""
+
+    app = IBApiPositionApp(
+        IBBrokerClient()
+    )
+
+    app.error(
+        reqId=-1,
+        errorTime=1770000000,
+        errorCode=2104,
+        errorString="Market data farm connection is OK.",
+    )
+
+    assert app.last_error_result is None
+
+    assert app.kill_switch.active is False

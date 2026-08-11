@@ -10,6 +10,10 @@ from ibapi.wrapper import EWrapper
 from app.execution_ledger import ExecutionLedger
 from app.ib_api_ready import IBApiReady
 from app.ib_broker_client import IBBrokerClient
+from app.ib_error_handler import (
+    IBErrorHandler,
+    IBErrorResult,
+)
 from app.ib_execution_details_transport import (
     IBExecutionDetailsTransport,
 )
@@ -18,6 +22,7 @@ from app.ib_order_status_transport import (
     IBOrderStatusTransport,
 )
 from app.ib_position_transport import IBPositionTransport
+from app.kill_switch import KillSwitch
 
 
 class IBApiPositionApp(EWrapper, EClient):
@@ -27,21 +32,19 @@ class IBApiPositionApp(EWrapper, EClient):
 
     - API handshake readiness;
     - IB order-ID allocation;
-    - position snapshots.
+    - position snapshots;
+    - emergency kill-switch state.
 
     When an ExecutionLedger is supplied, it additionally supports:
 
     - orderStatus callbacks;
     - execDetails callbacks;
-    - durable BTS execution-state updates.
+    - IB error classification;
+    - durable execution-state updates.
 
-    IB callbacks for broker orders that are not represented in the
-    BTS execution ledger are ignored by the execution transports,
-    while their order IDs are still observed by the allocator.
-
-    This allows manually created or otherwise external IB orders to
-    advance the safe order-ID floor without manufacturing BTS
-    execution records.
+    Broker orders that are not represented in the BTS execution
+    ledger do not manufacture BTS execution records. Their order
+    IDs may still advance the safe future IB order-ID floor.
     """
 
     def __init__(
@@ -50,6 +53,7 @@ class IBApiPositionApp(EWrapper, EClient):
         *,
         execution_ledger: ExecutionLedger | None = None,
         order_id_allocator: IBOrderIdAllocator | None = None,
+        kill_switch: KillSwitch | None = None,
     ) -> None:
         """Create the BTS Interactive Brokers API application."""
 
@@ -85,6 +89,18 @@ class IBApiPositionApp(EWrapper, EClient):
                 "IBOrderIdAllocator or None."
             )
 
+        if (
+            kill_switch is not None
+            and not isinstance(
+                kill_switch,
+                KillSwitch,
+            )
+        ):
+            raise TypeError(
+                "'kill_switch' must be a "
+                "KillSwitch or None."
+            )
+
         EWrapper.__init__(
             self
         )
@@ -110,6 +126,12 @@ class IBApiPositionApp(EWrapper, EClient):
             else IBOrderIdAllocator()
         )
 
+        self._kill_switch = (
+            kill_switch
+            if kill_switch is not None
+            else KillSwitch()
+        )
+
         self._execution_ledger = (
             execution_ledger
         )
@@ -117,6 +139,7 @@ class IBApiPositionApp(EWrapper, EClient):
         if execution_ledger is None:
             self._order_status_transport = None
             self._execution_details_transport = None
+            self._error_handler = None
 
         else:
             self._order_status_transport = (
@@ -131,7 +154,18 @@ class IBApiPositionApp(EWrapper, EClient):
                 )
             )
 
+            self._error_handler = (
+                IBErrorHandler(
+                    execution_ledger=execution_ledger,
+                    kill_switch=self._kill_switch,
+                )
+            )
+
         self._position_request_active = False
+
+        self._last_error_result: (
+            IBErrorResult | None
+        ) = None
 
     @property
     def broker_client(self) -> IBBrokerClient:
@@ -162,6 +196,12 @@ class IBApiPositionApp(EWrapper, EClient):
         return self._order_id_allocator
 
     @property
+    def kill_switch(self) -> KillSwitch:
+        """Return the BTS emergency kill switch."""
+
+        return self._kill_switch
+
+    @property
     def execution_ledger(
         self,
     ) -> ExecutionLedger | None:
@@ -181,9 +221,25 @@ class IBApiPositionApp(EWrapper, EClient):
     def execution_details_transport(
         self,
     ) -> IBExecutionDetailsTransport | None:
-        """Return the IB execution-details transport when configured."""
+        """Return the IB execution-details transport."""
 
         return self._execution_details_transport
+
+    @property
+    def error_handler(
+        self,
+    ) -> IBErrorHandler | None:
+        """Return the IB error handler when configured."""
+
+        return self._error_handler
+
+    @property
+    def last_error_result(
+        self,
+    ) -> IBErrorResult | None:
+        """Return the most recently classified IB message."""
+
+        return self._last_error_result
 
     @property
     def position_request_active(self) -> bool:
@@ -192,11 +248,7 @@ class IBApiPositionApp(EWrapper, EClient):
         return self._position_request_active
 
     def request_position_snapshot(self) -> None:
-        """Request the current IBKR position snapshot.
-
-        This starts BTS snapshot collection before calling the
-        official IBKR reqPositions() subscription method.
-        """
+        """Request the current IBKR position snapshot."""
 
         if self._position_request_active:
             raise RuntimeError(
@@ -223,16 +275,8 @@ class IBApiPositionApp(EWrapper, EClient):
         self,
         orderId: int,
     ) -> None:
-        """Receive IBKR API readiness and next order ID.
+        """Receive IBKR API readiness and next order ID."""
 
-        The existing IBApiReady tracker remains the connection
-        readiness authority.
-
-        The same callback also initializes or advances the
-        thread-safe BTS IB order-ID allocator.
-        """
-
-        # Preserve the existing readiness validation behavior first.
         self._api_ready.record_next_valid_id(
             orderId
         )
@@ -248,14 +292,7 @@ class IBApiPositionApp(EWrapper, EClient):
         order: Order,
         orderState: OrderState,
     ) -> None:
-        """Receive one IBKR open-order callback.
-
-        The callback is used here to advance the safe future
-        order-ID floor.
-
-        Execution-state transitions remain the responsibility of
-        orderStatus and execDetails.
-        """
+        """Receive one IBKR open-order callback."""
 
         self._order_id_allocator.observe_order_id(
             orderId
@@ -275,16 +312,7 @@ class IBApiPositionApp(EWrapper, EClient):
         whyHeld: str,
         mktCapPrice: float,
     ) -> None:
-        """Receive one IBKR orderStatus callback.
-
-        Every observed order ID advances the allocator floor.
-
-        If execution tracking is configured, known BTS orders are
-        passed into IBOrderStatusTransport.
-
-        Orders that do not belong to BTS are deliberately ignored
-        by the execution ledger while their IDs remain observed.
-        """
+        """Receive one IBKR orderStatus callback."""
 
         self._order_id_allocator.observe_order_id(
             orderId
@@ -306,9 +334,8 @@ class IBApiPositionApp(EWrapper, EClient):
             )
 
         except KeyError:
-            # IB can report orders that BTS did not create.
-            # Their IDs still matter to future safe allocation,
-            # but they must not manufacture BTS ledger records.
+            # IB may report an order that BTS did not create.
+            # Its ID still matters for future safe allocation.
             return
 
     def execDetails(
@@ -317,17 +344,11 @@ class IBApiPositionApp(EWrapper, EClient):
         contract: Contract,
         execution: Execution,
     ) -> None:
-        """Receive one IBKR execution-details callback.
+        """Receive one IBKR execution-details callback."""
 
-        Actual executions for known BTS orders flow into the
-        durable execution-details transport.
-
-        Executions for orders not represented in the BTS ledger
-        are ignored by BTS, while their broker order IDs still
-        advance the allocator floor.
-        """
-
-        broker_order_id = execution.orderId
+        broker_order_id = (
+            execution.orderId
+        )
 
         self._order_id_allocator.observe_order_id(
             broker_order_id
@@ -349,6 +370,54 @@ class IBApiPositionApp(EWrapper, EClient):
         except KeyError:
             # Execution belongs to an IB order outside BTS.
             return
+
+    def error(
+        self,
+        reqId: int,
+        errorTime: int,
+        errorCode: int,
+        errorString: str,
+        advancedOrderRejectJson="",
+    ) -> None:
+        """Receive and classify one official IBKR error callback.
+
+        TWS API 10.33+ supplies errorTime as a Unix timestamp.
+
+        IB uses this callback for genuine errors, warnings, and
+        informational notifications. Classification and BTS safety
+        action are therefore delegated to IBErrorHandler.
+
+        advancedOrderRejectJson is preserved in the audit message
+        when IB supplies it.
+        """
+
+        handler = self._error_handler
+
+        if handler is None:
+            return
+
+        message = errorString
+
+        if (
+            isinstance(
+                advancedOrderRejectJson,
+                str,
+            )
+            and advancedOrderRejectJson.strip()
+        ):
+            message = (
+                f"{errorString} "
+                "AdvancedOrderRejectJson: "
+                f"{advancedOrderRejectJson.strip()}"
+            )
+
+        self._last_error_result = (
+            handler.handle(
+                request_id=reqId,
+                error_code=errorCode,
+                message=message,
+            )
+        )
 
     def position(
         self,
@@ -376,10 +445,8 @@ class IBApiPositionApp(EWrapper, EClient):
 
         API readiness is invalidated immediately.
 
-        The order-ID allocator is intentionally retained. BTS must
-        not forget IDs it previously allocated or observed simply
-        because the socket connection was interrupted. A future
-        nextValidId callback can safely advance the allocator again.
+        Order-ID history is intentionally retained so a reconnect
+        cannot accidentally make an old IB order ID reusable.
         """
 
         self._position_request_active = False
