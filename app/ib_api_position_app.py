@@ -436,9 +436,13 @@ class IBApiPositionApp(EWrapper, EClient):
         )
 
     def positionEnd(self) -> None:
-        """Receive the IBKR initial-position snapshot completion."""
+        """Complete the IBKR position snapshot and stop updates."""
 
         self._position_transport.position_end()
+
+        if self._position_request_active:
+         self.cancelPositions()
+         self._position_request_active = False
 
     def connectionClosed(self) -> None:
         """Reset connection-specific local state.

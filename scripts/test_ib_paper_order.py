@@ -805,7 +805,7 @@ def main(
 
     ledger_path = (
         Path("data")
-        / "ib_first_paper_order.db"
+        / "ib_second_paper_order.db"
     )
 
     ledger_path.parent.mkdir(

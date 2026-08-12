@@ -1450,3 +1450,54 @@ def test_error_without_execution_ledger_is_safe() -> None:
     assert app.last_error_result is None
 
     assert app.kill_switch.active is False
+
+def test_position_end_cancels_position_subscription() -> None:
+    """Snapshot completion should stop continuing IB position updates."""
+
+    broker_client = IBBrokerClient()
+
+    app = IBApiPositionApp(
+        broker_client
+    )
+
+    with (
+        patch.object(
+            app,
+            "reqPositions",
+        ),
+        patch.object(
+            app,
+            "cancelPositions",
+        ) as cancel_positions,
+    ):
+        app.request_position_snapshot()
+
+        assert app.position_request_active is True
+
+        app.positionEnd()
+
+    cancel_positions.assert_called_once_with()
+
+    assert app.position_request_active is False
+
+
+def test_position_end_without_active_request_is_rejected() -> None:
+    """Stray positionEnd should fail closed and not cancel."""
+
+    app = IBApiPositionApp(
+        IBBrokerClient()
+    )
+
+    with patch.object(
+        app,
+        "cancelPositions",
+    ) as cancel_positions:
+        with pytest.raises(
+            RuntimeError,
+            match="IB position snapshot has not been started",
+        ):
+            app.positionEnd()
+
+    cancel_positions.assert_not_called()
+
+    assert app.position_request_active is False
