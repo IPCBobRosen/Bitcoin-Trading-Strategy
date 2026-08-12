@@ -1,6 +1,8 @@
 """Build official IBKR Contract and Order objects from BTS trade requests."""
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from ibapi.contract import Contract
 from ibapi.order import Order
@@ -27,6 +29,9 @@ class IBOrderFactory:
 
     Orders created here default to transmit=False as an additional
     safety barrier during development.
+
+    Limit orders require an explicit finite positive limit_price.
+    Non-limit orders may not carry a limit_price.
     """
 
     def __init__(
@@ -38,6 +43,7 @@ class IBOrderFactory:
         order_type: str = "MKT",
         time_in_force: str = "DAY",
         transmit: bool = False,
+        limit_price: Decimal | int | float | str | None = None,
     ) -> None:
         """Create an IB order factory."""
 
@@ -76,6 +82,13 @@ class IBOrderFactory:
 
         self._transmit = transmit
 
+        self._limit_price = (
+            self._validate_limit_price_configuration(
+                order_type=self._order_type,
+                limit_price=limit_price,
+            )
+        )
+
     @property
     def exchange(self) -> str:
         """Return the configured IBKR exchange value."""
@@ -111,6 +124,12 @@ class IBOrderFactory:
         """Return whether generated IB orders may transmit."""
 
         return self._transmit
+
+    @property
+    def limit_price(self) -> Decimal | None:
+        """Return the configured limit price when applicable."""
+
+        return self._limit_price
 
     def create(
         self,
@@ -223,6 +242,17 @@ class IBOrderFactory:
         order.tif = self._time_in_force
         order.transmit = self._transmit
 
+        if self._order_type == "LMT":
+            if self._limit_price is None:
+                raise RuntimeError(
+                    "Internal error: LMT order has "
+                    "no configured limit price."
+                )
+
+            order.lmtPrice = float(
+                self._limit_price
+            )
+
         return order
 
     @staticmethod
@@ -254,6 +284,73 @@ class IBOrderFactory:
         raise ValueError(
             f"Unsupported TradeIntent: {intent!r}."
         )
+
+    @staticmethod
+    def _validate_limit_price_configuration(
+        *,
+        order_type: str,
+        limit_price: Decimal | int | float | str | None,
+    ) -> Decimal | None:
+        """Validate order-type and limit-price consistency."""
+
+        if order_type == "LMT":
+            if limit_price is None:
+                raise ValueError(
+                    "'limit_price' is required "
+                    "when order_type is 'LMT'."
+                )
+
+            return IBOrderFactory._validate_positive_decimal(
+                limit_price,
+                "limit_price",
+            )
+
+        if limit_price is not None:
+            raise ValueError(
+                "'limit_price' may only be supplied "
+                "when order_type is 'LMT'."
+            )
+
+        return None
+
+    @staticmethod
+    def _validate_positive_decimal(
+        value: Any,
+        field_name: str,
+    ) -> Decimal:
+        """Validate a finite positive Decimal-compatible value."""
+
+        if isinstance(
+            value,
+            bool,
+        ):
+            raise ValueError(
+                f"'{field_name}' must be a positive number."
+            )
+
+        try:
+            normalized = Decimal(
+                str(value)
+            )
+
+        except (
+            InvalidOperation,
+            ValueError,
+            TypeError,
+        ) as error:
+            raise ValueError(
+                f"'{field_name}' must be a positive number."
+            ) from error
+
+        if (
+            not normalized.is_finite()
+            or normalized <= 0
+        ):
+            raise ValueError(
+                f"'{field_name}' must be a positive number."
+            )
+
+        return normalized
 
     @staticmethod
     def _validate_contract_month(
