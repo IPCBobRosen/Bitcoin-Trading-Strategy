@@ -1,5 +1,7 @@
 """Durable SQLite execution and idempotency ledger for BTS."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -593,7 +595,9 @@ class ExecutionLedger:
             for row in rows
         )
 
-    def _initialize_database(self) -> None:
+    def _initialize_database(
+        self,
+    ) -> None:
         """Create execution ledger tables if necessary."""
 
         with self._connect() as connection:
@@ -646,10 +650,11 @@ class ExecutionLedger:
                 """
             )
 
+    @contextmanager
     def _connect(
         self,
-    ) -> sqlite3.Connection:
-        """Open a configured SQLite connection."""
+    ) -> Iterator[sqlite3.Connection]:
+        """Open, commit or roll back, and always close SQLite."""
 
         connection = sqlite3.connect(
             self._database_path
@@ -659,7 +664,12 @@ class ExecutionLedger:
             "PRAGMA foreign_keys = ON"
         )
 
-        return connection
+        try:
+            with connection:
+                yield connection
+
+        finally:
+            connection.close()
 
     @staticmethod
     def _record_from_row(
