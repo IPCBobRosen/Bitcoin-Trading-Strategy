@@ -25,6 +25,14 @@ EagleMessage = (
 )
 
 
+LIFECYCLE_MESSAGE_TYPES = frozenset(
+    {
+        "fund.entry",
+        "fund.exit",
+    }
+)
+
+
 class EagleAuthenticationError(ConnectionError):
     """Raised when Eagle rejects the WebSocket handshake with HTTP 401."""
 
@@ -231,7 +239,7 @@ class EagleClient:
 
         fund.heartbeat frames become EagleHeartbeat objects.
 
-        Lifecycle frames become IncomingLifecycleEvent objects.
+        Supported lifecycle frames become IncomingLifecycleEvent objects.
         """
 
         if not isinstance(raw_message, str):
@@ -266,6 +274,12 @@ class EagleClient:
         if message_type == "fund.heartbeat":
             return EagleHeartbeat.from_dict(
                 decoded_message
+            )
+
+        if message_type not in LIFECYCLE_MESSAGE_TYPES:
+            raise ValueError(
+                "Unsupported Eagle message type: "
+                f"{message_type!r}."
             )
 
         return IncomingLifecycleEvent.from_dict(

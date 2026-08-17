@@ -793,3 +793,111 @@ def test_authentication_error_does_not_expose_api_key() -> None:
         secret_key
         not in str(exc_info.value)
     )
+
+
+@pytest.mark.parametrize(
+    "message_type",
+    [
+        "fund.unknown",
+        "fund.add",
+        "trade.lifecycle",
+        "",
+    ],
+)
+def test_parse_rejects_unsupported_message_type(
+    message_type: str,
+) -> None:
+    """Unknown Eagle frame types must fail closed."""
+
+    client = EagleClient(
+        "ws://localhost:8765"
+    )
+
+    message = {
+        "type": message_type,
+        "seq": 1,
+        "event_id": "event-001",
+        "signal_id": "signal-001",
+        "ts": "2026-08-16T20:00:00+00:00",
+        "env": "staging",
+        "payload": {
+            "intent": "BUY_TO_OPEN",
+        },
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="Unsupported Eagle message type",
+    ):
+        client._parse_message(
+            json.dumps(
+                message
+            )
+        )
+
+
+def test_parse_accepts_fund_exit() -> None:
+    """fund.exit must remain a supported lifecycle frame."""
+
+    client = EagleClient(
+        "ws://localhost:8765"
+    )
+
+    message = {
+        "type": "fund.exit",
+        "seq": 2,
+        "event_id": "exit-event-001",
+        "signal_id": "signal-001",
+        "ts": "2026-08-16T20:01:00+00:00",
+        "env": "staging",
+        "payload": {
+            "intent": "SELL_TO_CLOSE",
+        },
+    }
+
+    event = client._parse_message(
+        json.dumps(
+            message
+        )
+    )
+
+    assert isinstance(
+        event,
+        IncomingLifecycleEvent,
+    )
+
+    assert event.message_type == "fund.exit"
+
+    assert (
+        event.payload["intent"]
+        == "SELL_TO_CLOSE"
+    )
+
+
+def test_parse_rejects_missing_type_even_with_valid_trade_fields() -> None:
+    """Trade-shaped JSON without a recognized type must fail closed."""
+
+    client = EagleClient(
+        "ws://localhost:8765"
+    )
+
+    message = {
+        "seq": 1,
+        "event_id": "event-001",
+        "signal_id": "signal-001",
+        "ts": "2026-08-16T20:00:00+00:00",
+        "env": "staging",
+        "payload": {
+            "intent": "BUY_TO_OPEN",
+        },
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="Unsupported Eagle message type",
+    ):
+        client._parse_message(
+            json.dumps(
+                message
+            )
+        )

@@ -30,7 +30,7 @@ def create_test_event(
 
     return IncomingLifecycleEvent.from_dict(
         {
-            "type": "fund.lifecycle",
+            "type": "fund.entry",
             "seq": seq,
             "event_id": event_id,
             "signal_id": signal_id,
