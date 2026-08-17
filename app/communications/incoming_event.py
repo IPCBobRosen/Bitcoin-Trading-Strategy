@@ -13,6 +13,14 @@ class IncomingLifecycleEvent:
 
     This object preserves the communication envelope and the event-specific
     payload. It does not represent an executable order.
+
+    Eagle may supply lifecycle-specific information either inside the
+    traditional ``payload`` object or, for real fund.entry messages, inside
+    the top-level ``signal`` object.
+
+    When a top-level ``signal`` object is supplied, it is preserved inside
+    ``payload["signal"]`` so downstream BTS protocol adapters can inspect it
+    without changing the IncomingLifecycleEvent data model.
     """
 
     message_type: str
@@ -42,8 +50,15 @@ class IncomingLifecycleEvent:
         missing_fields = required_fields.difference(message)
 
         if missing_fields:
-            missing = ", ".join(sorted(missing_fields))
-            raise ValueError(f"Missing required field(s): {missing}")
+            missing = ", ".join(
+                sorted(
+                    missing_fields
+                )
+            )
+
+            raise ValueError(
+                f"Missing required field(s): {missing}"
+            )
 
         message_type = message["type"]
         seq = message["seq"]
@@ -51,47 +66,107 @@ class IncomingLifecycleEvent:
         signal_id = message["signal_id"]
         timestamp_text = message["ts"]
         environment_text = message["env"]
-        raw_payload = message.get("payload", {})
 
-        if not isinstance(message_type, str) or not message_type.strip():
-            raise ValueError("'type' must be a non-empty string.")
+        raw_payload = message.get(
+            "payload",
+            {},
+        )
+
+        raw_signal = message.get(
+            "signal"
+        )
+
+        if (
+            not isinstance(message_type, str)
+            or not message_type.strip()
+        ):
+            raise ValueError(
+                "'type' must be a non-empty string."
+            )
 
         if (
             not isinstance(seq, int)
             or isinstance(seq, bool)
             or seq < 0
         ):
-            raise ValueError("'seq' must be a non-negative integer.")
+            raise ValueError(
+                "'seq' must be a non-negative integer."
+            )
 
-        if not isinstance(event_id, str) or not event_id.strip():
-            raise ValueError("'event_id' must be a non-empty string.")
+        if (
+            not isinstance(event_id, str)
+            or not event_id.strip()
+        ):
+            raise ValueError(
+                "'event_id' must be a non-empty string."
+            )
 
-        if not isinstance(signal_id, str) or not signal_id.strip():
-            raise ValueError("'signal_id' must be a non-empty string.")
+        if (
+            not isinstance(signal_id, str)
+            or not signal_id.strip()
+        ):
+            raise ValueError(
+                "'signal_id' must be a non-empty string."
+            )
 
-        if not isinstance(timestamp_text, str):
-            raise ValueError("'ts' must be an ISO-8601 timestamp string.")
+        if not isinstance(
+            timestamp_text,
+            str,
+        ):
+            raise ValueError(
+                "'ts' must be an ISO-8601 timestamp string."
+            )
 
         try:
             timestamp = datetime.fromisoformat(
-                timestamp_text.replace("Z", "+00:00")
+                timestamp_text.replace(
+                    "Z",
+                    "+00:00",
+                )
             )
+
         except ValueError as error:
             raise ValueError(
                 "'ts' must be a valid ISO-8601 timestamp."
             ) from error
 
         try:
-            environment = Environment(environment_text)
+            environment = Environment(
+                environment_text
+            )
+
         except (TypeError, ValueError) as error:
             raise ValueError(
                 "'env' must be either 'staging' or 'live'."
             ) from error
 
-        if not isinstance(raw_payload, Mapping):
-            raise ValueError("'payload' must be a JSON object.")
+        if not isinstance(
+            raw_payload,
+            Mapping,
+        ):
+            raise ValueError(
+                "'payload' must be a JSON object."
+            )
 
-        payload = dict(raw_payload)
+        if (
+            raw_signal is not None
+            and not isinstance(
+                raw_signal,
+                Mapping,
+            )
+        ):
+            raise ValueError(
+                "'signal' must be a JSON object when supplied."
+            )
+
+        payload = dict(
+            raw_payload
+        )
+
+        if raw_signal is not None:
+            payload["signal"] = dict(
+                raw_signal
+            )
 
         return cls(
             message_type=message_type,
