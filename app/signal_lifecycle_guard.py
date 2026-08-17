@@ -1,6 +1,8 @@
 """Durably enforce valid Eagle signal lifecycle transitions."""
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -514,14 +516,22 @@ class SignalLifecycleGuard:
                 """
             )
 
+    @contextmanager
     def _connect(
         self,
-    ) -> sqlite3.Connection:
-        """Open one SQLite connection."""
+    ) -> Iterator[sqlite3.Connection]:
+        """Open, commit or roll back, and always close SQLite."""
 
-        return sqlite3.connect(
+        connection = sqlite3.connect(
             self._database_path
         )
+
+        try:
+            with connection:
+                yield connection
+
+        finally:
+            connection.close()
 
     @staticmethod
     def _validate_identifier(

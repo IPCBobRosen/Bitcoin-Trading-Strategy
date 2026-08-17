@@ -1,8 +1,11 @@
 """Persistent storage for Eagle event IDs and sequence cursors."""
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
+
 
 class EventProcessingResult(Enum):
     """Result of atomically evaluating an Eagle event."""
@@ -15,7 +18,10 @@ class EventProcessingResult(Enum):
 class EventStore:
     """Persist Eagle processing state in a SQLite database."""
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(
+        self,
+        database_path: str | Path,
+    ) -> None:
         """Create or open the SQLite event store.
 
         Args:
@@ -23,10 +29,16 @@ class EventStore:
                 File path to the SQLite database.
         """
 
-        self._database_path = Path(database_path)
+        self._database_path = Path(
+            database_path
+        )
 
-        if not str(self._database_path).strip():
-            raise ValueError("'database_path' must be a valid path.")
+        if not str(
+            self._database_path
+        ).strip():
+            raise ValueError(
+                "'database_path' must be a valid path."
+            )
 
         self._database_path.parent.mkdir(
             parents=True,
@@ -41,10 +53,15 @@ class EventStore:
 
         return self._database_path
 
-    def has_processed_event(self, event_id: str) -> bool:
+    def has_processed_event(
+        self,
+        event_id: str,
+    ) -> bool:
         """Return True if event_id has already been persisted."""
 
-        self._validate_event_id(event_id)
+        self._validate_event_id(
+            event_id
+        )
 
         with self._connect() as connection:
             row = connection.execute(
@@ -54,29 +71,44 @@ class EventStore:
                 WHERE event_id = ?
                 LIMIT 1
                 """,
-                (event_id,),
+                (
+                    event_id,
+                ),
             ).fetchone()
 
         return row is not None
 
-    def mark_event_processed(self, event_id: str) -> None:
+    def mark_event_processed(
+        self,
+        event_id: str,
+    ) -> None:
         """Persist an event ID as processed.
 
-        Re-marking the same event ID is safe and does not create duplicates.
+        Re-marking the same event ID is safe and does not
+        create duplicates.
         """
 
-        self._validate_event_id(event_id)
+        self._validate_event_id(
+            event_id
+        )
 
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO processed_events (event_id)
+                INSERT OR IGNORE INTO processed_events (
+                    event_id
+                )
                 VALUES (?)
                 """,
-                (event_id,),
+                (
+                    event_id,
+                ),
             )
 
-    def check_and_mark_event(self, event_id: str) -> bool:
+    def check_and_mark_event(
+        self,
+        event_id: str,
+    ) -> bool:
         """Atomically check whether event_id is new and persist it.
 
         Returns:
@@ -87,20 +119,28 @@ class EventStore:
                 The event ID had already been persisted.
         """
 
-        self._validate_event_id(event_id)
+        self._validate_event_id(
+            event_id
+        )
 
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT OR IGNORE INTO processed_events (event_id)
+                INSERT OR IGNORE INTO processed_events (
+                    event_id
+                )
                 VALUES (?)
                 """,
-                (event_id,),
+                (
+                    event_id,
+                ),
             )
 
             return cursor.rowcount == 1
 
-    def get_last_seq(self) -> int | None:
+    def get_last_seq(
+        self,
+    ) -> int | None:
         """Return the last durable Eagle sequence cursor."""
 
         with self._connect() as connection:
@@ -115,12 +155,19 @@ class EventStore:
         if row is None:
             return None
 
-        return int(row[0])
+        return int(
+            row[0]
+        )
 
-    def mark_seq_processed(self, seq: int) -> None:
+    def mark_seq_processed(
+        self,
+        seq: int,
+    ) -> None:
         """Advance the durable sequence cursor when seq is newer."""
 
-        self._validate_seq(seq)
+        self._validate_seq(
+            seq
+        )
 
         with self._connect() as connection:
             current_row = connection.execute(
@@ -134,14 +181,22 @@ class EventStore:
             if current_row is None:
                 connection.execute(
                     """
-                    INSERT INTO sequence_state (id, last_seq)
+                    INSERT INTO sequence_state (
+                        id,
+                        last_seq
+                    )
                     VALUES (1, ?)
                     """,
-                    (seq,),
+                    (
+                        seq,
+                    ),
                 )
+
                 return
 
-            current_seq = int(current_row[0])
+            current_seq = int(
+                current_row[0]
+            )
 
             if seq > current_seq:
                 connection.execute(
@@ -150,13 +205,20 @@ class EventStore:
                     SET last_seq = ?
                     WHERE id = 1
                     """,
-                    (seq,),
+                    (
+                        seq,
+                    ),
                 )
 
-    def check_and_mark_seq(self, seq: int) -> bool:
+    def check_and_mark_seq(
+        self,
+        seq: int,
+    ) -> bool:
         """Check whether seq is newer and persist it if so."""
 
-        self._validate_seq(seq)
+        self._validate_seq(
+            seq
+        )
 
         with self._connect() as connection:
             current_row = connection.execute(
@@ -170,14 +232,22 @@ class EventStore:
             if current_row is None:
                 connection.execute(
                     """
-                    INSERT INTO sequence_state (id, last_seq)
+                    INSERT INTO sequence_state (
+                        id,
+                        last_seq
+                    )
                     VALUES (1, ?)
                     """,
-                    (seq,),
+                    (
+                        seq,
+                    ),
                 )
+
                 return True
 
-            current_seq = int(current_row[0])
+            current_seq = int(
+                current_row[0]
+            )
 
             if seq <= current_seq:
                 return False
@@ -188,12 +258,13 @@ class EventStore:
                 SET last_seq = ?
                 WHERE id = 1
                 """,
-                (seq,),
+                (
+                    seq,
+                ),
             )
 
             return True
 
-      
     def check_and_mark_event_with_seq(
         self,
         event_id: str,
@@ -205,19 +276,26 @@ class EventStore:
 
         Returns:
             EventProcessingResult.ACCEPTED:
-                The event ID is new and the sequence is newer. Both are
-                persisted in one SQLite transaction.
+                The event ID is new and the sequence is newer.
+                Both are persisted in one SQLite transaction.
 
             EventProcessingResult.DUPLICATE_EVENT:
-                The event ID has already been processed. Nothing changes.
+                The event ID has already been processed.
+                Nothing changes.
 
             EventProcessingResult.OUT_OF_SEQUENCE:
-                The event ID is new, but the sequence is equal to or older
-                than the durable cursor. Nothing changes.
+                The event ID is new, but the sequence is equal
+                to or older than the durable cursor.
+                Nothing changes.
         """
 
-        self._validate_event_id(event_id)
-        self._validate_seq(seq)
+        self._validate_event_id(
+            event_id
+        )
+
+        self._validate_seq(
+            seq
+        )
 
         with self._connect() as connection:
             duplicate_row = connection.execute(
@@ -227,11 +305,15 @@ class EventStore:
                 WHERE event_id = ?
                 LIMIT 1
                 """,
-                (event_id,),
+                (
+                    event_id,
+                ),
             ).fetchone()
 
             if duplicate_row is not None:
-                return EventProcessingResult.DUPLICATE_EVENT
+                return (
+                    EventProcessingResult.DUPLICATE_EVENT
+                )
 
             sequence_row = connection.execute(
                 """
@@ -242,27 +324,41 @@ class EventStore:
             ).fetchone()
 
             if sequence_row is not None:
-                current_seq = int(sequence_row[0])
+                current_seq = int(
+                    sequence_row[0]
+                )
 
                 if seq <= current_seq:
-                    return EventProcessingResult.OUT_OF_SEQUENCE
+                    return (
+                        EventProcessingResult.OUT_OF_SEQUENCE
+                    )
 
             connection.execute(
                 """
-                INSERT INTO processed_events (event_id)
+                INSERT INTO processed_events (
+                    event_id
+                )
                 VALUES (?)
                 """,
-                (event_id,),
+                (
+                    event_id,
+                ),
             )
 
             if sequence_row is None:
                 connection.execute(
                     """
-                    INSERT INTO sequence_state (id, last_seq)
+                    INSERT INTO sequence_state (
+                        id,
+                        last_seq
+                    )
                     VALUES (1, ?)
                     """,
-                    (seq,),
+                    (
+                        seq,
+                    ),
                 )
+
             else:
                 connection.execute(
                     """
@@ -270,12 +366,19 @@ class EventStore:
                     SET last_seq = ?
                     WHERE id = 1
                     """,
-                    (seq,),
+                    (
+                        seq,
+                    ),
                 )
 
-        return EventProcessingResult.ACCEPTED        
-    def _initialize_database(self) -> None:
-        """Create required SQLite tables if they do not already exist."""
+        return (
+            EventProcessingResult.ACCEPTED
+        )
+
+    def _initialize_database(
+        self,
+    ) -> None:
+        """Create required SQLite tables if needed."""
 
         with self._connect() as connection:
             connection.execute(
@@ -295,25 +398,59 @@ class EventStore:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a SQLite connection."""
+    @contextmanager
+    def _connect(
+        self,
+    ) -> Iterator[
+        sqlite3.Connection
+    ]:
+        """Open, commit or roll back, and always close SQLite."""
 
-        return sqlite3.connect(self._database_path)
+        connection = sqlite3.connect(
+            self._database_path
+        )
+
+        try:
+            with connection:
+                yield connection
+
+        finally:
+            connection.close()
 
     @staticmethod
-    def _validate_event_id(event_id: str) -> None:
+    def _validate_event_id(
+        event_id: str,
+    ) -> None:
         """Validate an Eagle event ID."""
 
-        if not isinstance(event_id, str) or not event_id.strip():
-            raise ValueError("'event_id' must be a non-empty string.")
+        if (
+            not isinstance(
+                event_id,
+                str,
+            )
+            or not event_id.strip()
+        ):
+            raise ValueError(
+                "'event_id' must be a non-empty string."
+            )
 
     @staticmethod
-    def _validate_seq(seq: int) -> None:
+    def _validate_seq(
+        seq: int,
+    ) -> None:
         """Validate an Eagle sequence number."""
 
         if (
-            not isinstance(seq, int)
-            or isinstance(seq, bool)
+            not isinstance(
+                seq,
+                int,
+            )
+            or isinstance(
+                seq,
+                bool,
+            )
             or seq < 0
         ):
-            raise ValueError("'seq' must be a non-negative integer.")
+            raise ValueError(
+                "'seq' must be a non-negative integer."
+            )
