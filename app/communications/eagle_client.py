@@ -15,12 +15,14 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from app.communications.eagle_heartbeat import EagleHeartbeat
 from app.communications.eagle_hello import EagleHello
+from app.communications.eagle_update import EagleUpdate
 from app.communications.incoming_event import IncomingLifecycleEvent
 
 
 EagleMessage = (
     EagleHello
     | EagleHeartbeat
+    | EagleUpdate
     | IncomingLifecycleEvent
 )
 
@@ -273,6 +275,11 @@ class EagleClient:
 
         if message_type == "fund.heartbeat":
             return EagleHeartbeat.from_dict(
+                decoded_message
+            )
+
+        if message_type == "fund.update":
+            return EagleUpdate.from_payload(
                 decoded_message
             )
 
