@@ -1,4 +1,4 @@
-"""Continuous real Eagle LIVE -> IB paper trader.
+"""Continuous real Eagle STAGING -> IB paper trader.
 
 Version 1 continuously listens for Eagle Fund signals and executes only
 BTCUSDT entry/exit lifecycle events as one-contract MBT paper orders.
@@ -8,7 +8,7 @@ management is intentionally disabled in Version 1. Updates never create a
 TradeRequest or broker order.
 
 Safety rules:
-- Eagle environment must be live.
+- Eagle environment must be staging.
 - TWS paper endpoint only.
 - BTCUSDT -> MBT only.
 - Exactly 1 MBT; maximum absolute position 1; no pyramiding.
@@ -61,7 +61,7 @@ from app.trading_controls import TradingControls
 
 
 EAGLE_URI = "wss://tracer.eagleailabs.com/ipc-api/ipc/v1/fund/stream"
-EAGLE_API_KEY_ENVIRONMENT_VARIABLE = "BTS_EAGLE_LIVE_API_KEY"
+EAGLE_API_KEY_ENVIRONMENT_VARIABLE = "BTS_EAGLE_API_KEY"
 
 IB_HOST = "127.0.0.1"
 IB_PORT = 7497
@@ -80,9 +80,9 @@ MAX_DAILY_LOSS = Decimal("1000")
 MAX_ORDER_QUANTITY = 1
 MAX_ABSOLUTE_POSITION = 1
 
-DEFAULT_EVENT_DATABASE = Path("data") / "real_eagle_live_events.db"
-DEFAULT_LIFECYCLE_DATABASE = Path("data") / "real_eagle_live_signals.db"
-DEFAULT_EXECUTION_LEDGER = Path("data") / "real_eagle_live_execution.db"
+DEFAULT_EVENT_DATABASE = Path("data") / "real_eagle_to_ib_bridge_events.db"
+DEFAULT_LIFECYCLE_DATABASE = Path("data") / "real_eagle_to_ib_bridge_signals.db"
+DEFAULT_EXECUTION_LEDGER = Path("data") / "real_eagle_to_ib_bridge_execution.db"
 
 CONNECTION_TIMEOUT_SECONDS = 10.0
 EXECUTION_TIMEOUT_SECONDS = 20.0
@@ -467,7 +467,7 @@ async def run_continuous_paper_trader(
     execution_ledger_path: str | Path,
     max_messages: int,
 ) -> ContinuousPaperResult:
-    """Run the continuous Eagle LIVE -> TWS paper trader."""
+    """Run the continuous Eagle STAGING -> TWS paper trader."""
 
     if not isinstance(armed, bool):
         raise TypeError("'armed' must be a bool.")
@@ -607,7 +607,7 @@ async def run_continuous_paper_trader(
         print("REAL EAGLE -> IB CONTINUOUS PAPER TRADER")
         print("=" * 72)
         print(f"Eagle URI: {eagle_client._connection_uri()}")
-        print("Environment required: LIVE")
+        print("Environment required: STAGING")
         print("Historical replay orders: BLOCKED")
         print("Post-replay heartbeat required: YES")
         print("BTCUSDT -> MBT only")
@@ -629,7 +629,7 @@ async def run_continuous_paper_trader(
 
             if isinstance(message, EagleHello):
                 hello_received = True
-                staging_confirmed = message.environment.value == "live"
+                staging_confirmed = message.environment.value == "staging"
                 replay_expected = message.replay_count
                 replay_processed = 0
                 replay_complete = replay_expected == 0
@@ -645,7 +645,7 @@ async def run_continuous_paper_trader(
                 if not staging_confirmed:
                     raise RuntimeError(
                         "Safety violation: continuous paper trader connected to "
-                        "non-LIVE Eagle environment."
+                        "non-STAGING Eagle environment."
                     )
 
                 if message.open_count != 0:
@@ -1195,7 +1195,7 @@ def parse_arguments() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Run the continuous Eagle LIVE -> Interactive Brokers PAPER trader."
+            "Run the continuous Eagle STAGING -> Interactive Brokers PAPER trader."
         )
     )
 
@@ -1229,7 +1229,7 @@ def main() -> int:
     api_key = os.environ.get(EAGLE_API_KEY_ENVIRONMENT_VARIABLE)
 
     if not api_key:
-        print("BTS_EAGLE_LIVE_API_KEY is not configured.")
+        print("BTS_EAGLE_API_KEY is not configured.")
         return 1
 
     armed = bool(arguments.confirm_continuous_paper)

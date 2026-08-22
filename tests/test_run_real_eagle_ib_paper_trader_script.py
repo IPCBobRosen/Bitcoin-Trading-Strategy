@@ -195,11 +195,11 @@ def test_eagle_uri_is_expected_fund_lane() -> None:
 
 
 def test_api_key_comes_from_environment() -> None:
-    """Eagle credential must remain outside source."""
+    """LIVE Eagle credential must remain outside source."""
 
     assert (
         EAGLE_API_KEY_ENVIRONMENT_VARIABLE
-        == "BTS_EAGLE_API_KEY"
+        == "BTS_EAGLE_LIVE_API_KEY"
     )
 
 
@@ -256,22 +256,22 @@ def test_exact_arming_argument() -> None:
     )
 
 
-def test_durable_paths_reuse_proven_bridge_state() -> None:
-    """Continuous runner should reuse reconciled durable databases."""
+def test_durable_paths_use_isolated_live_state() -> None:
+    """LIVE Eagle runner must use isolated durable databases."""
 
     assert (
         DEFAULT_EVENT_DATABASE.name
-        == "real_eagle_to_ib_bridge_events.db"
+        == "real_eagle_live_events.db"
     )
 
     assert (
         DEFAULT_LIFECYCLE_DATABASE.name
-        == "real_eagle_to_ib_bridge_signals.db"
+        == "real_eagle_live_signals.db"
     )
 
     assert (
         DEFAULT_EXECUTION_LEDGER.name
-        == "real_eagle_to_ib_bridge_execution.db"
+        == "real_eagle_live_execution.db"
     )
 
 
@@ -1360,7 +1360,7 @@ def test_script_does_not_embed_api_key() -> None:
     source = script_source()
 
     assert (
-        "BTS_EAGLE_API_KEY"
+        "BTS_EAGLE_LIVE_API_KEY"
         in source
     )
 
