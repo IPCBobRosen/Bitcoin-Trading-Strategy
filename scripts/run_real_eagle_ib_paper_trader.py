@@ -945,25 +945,35 @@ async def run_continuous_paper_trader(
                         )
                         continue
 
-                    decision = (
-                        coordinator.process_event(
+                    prepared_decision = (
+                        coordinator.prepare_event(
                             normalized_event
                         )
                     )
 
-                    print(f"Trade decision approved: {decision.approved}")
-                    print(f"Trade decision reason:   {decision.reason}")
+                    print(
+                        "Trade preparation approved: "
+                        f"{prepared_decision.approved}"
+                    )
+                    print(
+                        "Trade preparation reason:   "
+                        f"{prepared_decision.reason}"
+                    )
 
-                    if not decision.approved:
+                    if not prepared_decision.approved:
                         rejected_decisions += 1
-                        print("Decision rejected; no broker submission.")
+                        print(
+                            "Trade preparation rejected; "
+                            "durable lifecycle was NOT mutated."
+                        )
                         continue
 
-                    approved_decisions += 1
-                    trade_request = decision.trade_request
+                    trade_request = prepared_decision.trade_request
 
                     if trade_request is None:
-                        raise RuntimeError("Approved decision had no TradeRequest.")
+                        raise RuntimeError(
+                            "Approved prepared decision had no TradeRequest."
+                        )
 
                     validate_trade_request_against_position(
                         trade_request=trade_request,
@@ -983,16 +993,70 @@ async def run_continuous_paper_trader(
                     )
 
                     if not risk_decision.approved:
+                        rejected_decisions += 1
                         raise RuntimeError(
-                            "RiskManager rejected an approved live Eagle TradeRequest: "
+                            "RiskManager rejected live Eagle TradeRequest "
+                            "BEFORE durable lifecycle mutation: "
                             f"{risk_decision.reason}"
                         )
 
-                    expected_position = expected_position_after_trade(trade_request)
+                    expected_position = expected_position_after_trade(
+                        trade_request
+                    )
 
                     if risk_decision.projected_position != expected_position:
                         raise RuntimeError(
-                            "Risk projected position does not match expected trade result."
+                            "Risk projected position does not match "
+                            "expected trade result."
+                        )
+
+                    readiness = IBTradingReadiness(
+                        api_ready=app.api_ready,
+                        order_id_allocator=app.order_id_allocator,
+                        broker_client=broker_client,
+                        trading_controls=trading_controls,
+                        kill_switch=kill_switch,
+                    )
+
+                    readiness_result = readiness.require_ready(
+                        positions_reconciled=True,
+                        execution_state_clear=True,
+                    )
+
+                    print(
+                        f"IB readiness passed: {readiness_result.ready}"
+                    )
+
+                    # All external safety checks have passed.
+                    # Only now may BTS commit the durable Eagle lifecycle transition.
+                    decision = coordinator.commit_request(
+                        trade_request
+                    )
+
+                    print(f"Trade decision approved: {decision.approved}")
+                    print(f"Trade decision reason:   {decision.reason}")
+
+                    if not decision.approved:
+                        rejected_decisions += 1
+                        print(
+                            "Lifecycle commit rejected; "
+                            "no broker submission."
+                        )
+                        continue
+
+                    approved_decisions += 1
+
+                    committed_trade_request = decision.trade_request
+
+                    if committed_trade_request is None:
+                        raise RuntimeError(
+                            "Approved lifecycle commit had no TradeRequest."
+                        )
+
+                    if committed_trade_request != trade_request:
+                        raise RuntimeError(
+                            "Committed TradeRequest does not match "
+                            "the risk-approved TradeRequest."
                         )
 
                     post_decision_open_signals = load_durable_open_signals(
@@ -1016,6 +1080,7 @@ async def run_continuous_paper_trader(
                             if expected_position == 1
                             else SignalLifecycleState.SHORT_OPEN
                         )
+
                         durable_open = post_decision_open_signals[0]
 
                         if (
@@ -1026,20 +1091,6 @@ async def run_continuous_paper_trader(
                                 "Post-decision durable lifecycle does not match "
                                 "the TradeRequest."
                             )
-
-                    readiness = IBTradingReadiness(
-                        api_ready=app.api_ready,
-                        order_id_allocator=app.order_id_allocator,
-                        broker_client=broker_client,
-                        trading_controls=trading_controls,
-                        kill_switch=kill_switch,
-                    )
-
-                    readiness_result = readiness.require_ready(
-                        positions_reconciled=True,
-                        execution_state_clear=True,
-                    )
-                    print(f"IB readiness passed: {readiness_result.ready}")
 
                     broker_order_id = app.order_id_allocator.allocate()
 

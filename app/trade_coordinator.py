@@ -59,18 +59,16 @@ class TradeCoordinator:
 
         return self._signal_lifecycle_guard
 
-    def process_event(
+    def prepare_event(
         self,
         event: IncomingLifecycleEvent,
     ) -> TradeDecision:
-        """Evaluate one accepted Eagle event and return a trade decision.
+        """Build a TradeRequest without mutating durable lifecycle state.
 
-        Processing order:
-
-        1. Trading must be enabled.
-        2. Build the BTS TradeRequest.
-        3. Validate the Eagle signal lifecycle transition.
-        4. Approve only when lifecycle state is valid.
+        This method is intentionally non-mutating so external safety
+        layers such as broker-position validation, RiskManager, kill
+        switch checks, and broker-readiness checks can run before BTS
+        commits an Eagle lifecycle transition.
         """
 
         if not isinstance(
@@ -96,6 +94,26 @@ class TradeCoordinator:
             settings=settings,
         )
 
+        return TradeDecision(
+            approved=True,
+            reason=APPROVED,
+            trade_request=request,
+        )
+
+    def commit_request(
+        self,
+        request: TradeRequest,
+    ) -> TradeDecision:
+        """Validate and durably commit one prepared lifecycle request."""
+
+        if not isinstance(
+            request,
+            TradeRequest,
+        ):
+            raise TypeError(
+                "'request' must be a TradeRequest."
+            )
+
         lifecycle_decision = (
             self._signal_lifecycle_guard.process(
                 request
@@ -115,4 +133,41 @@ class TradeCoordinator:
             approved=True,
             reason=APPROVED,
             trade_request=request,
+        )
+
+    def process_event(
+        self,
+        event: IncomingLifecycleEvent,
+    ) -> TradeDecision:
+        """Evaluate one accepted Eagle event and return a trade decision.
+
+        This compatibility method preserves the original coordinator
+        behavior for existing callers:
+
+        1. Trading must be enabled.
+        2. Build the BTS TradeRequest.
+        3. Validate and commit the Eagle signal lifecycle transition.
+        4. Approve only when lifecycle state is valid.
+
+        Safety-critical callers that must perform external risk or broker
+        checks before lifecycle mutation should call prepare_event(),
+        perform those checks, and then call commit_request().
+        """
+
+        prepared = self.prepare_event(
+            event
+        )
+
+        if not prepared.approved:
+            return prepared
+
+        request = prepared.trade_request
+
+        if request is None:
+            raise RuntimeError(
+                "Approved prepared decision had no TradeRequest."
+            )
+
+        return self.commit_request(
+            request
         )

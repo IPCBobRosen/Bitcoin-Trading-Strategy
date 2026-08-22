@@ -1112,7 +1112,7 @@ def test_script_rejects_nonzero_eagle_open_count() -> None:
 
 
 def test_script_has_observe_only_boundary_before_coordinator() -> None:
-    """Unarmed live mode must stop before TradeCoordinator mutation."""
+    """Unarmed live mode must stop before TradeCoordinator preparation."""
 
     source = script_source()
 
@@ -1120,15 +1120,12 @@ def test_script_has_observe_only_boundary_before_coordinator() -> None:
         "# OBSERVE-ONLY HARD BOUNDARY"
     )
 
-    coordinator_index = source.index(
-        "coordinator.process_event(",
+    prepare_index = source.index(
+        "coordinator.prepare_event(",
         boundary_index,
     )
 
-    assert (
-        boundary_index
-        < coordinator_index
-    )
+    assert boundary_index < prepare_index
 
 
 def test_script_unarmed_boundary_uses_continue() -> None:
@@ -1366,3 +1363,33 @@ def test_script_does_not_embed_api_key() -> None:
 
     assert "Bearer " not in source
     assert "SUPER-SECRET" not in source
+
+def test_armed_live_path_runs_risk_before_lifecycle_mutation() -> None:
+    """Risk approval must occur before durable lifecycle commit."""
+
+    source = script_source()
+
+    armed_path_index = source.index(
+        "# Armed path begins here."
+    )
+
+    prepare_index = source.index(
+        "coordinator.prepare_event(",
+        armed_path_index,
+    )
+
+    risk_index = source.index(
+        "risk_manager.evaluate(",
+        armed_path_index,
+    )
+
+    commit_index = source.index(
+        "coordinator.commit_request(",
+        armed_path_index,
+    )
+
+    assert (
+        prepare_index
+        < risk_index
+        < commit_index
+    )
