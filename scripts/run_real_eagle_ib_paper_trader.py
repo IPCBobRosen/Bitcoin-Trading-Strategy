@@ -89,6 +89,7 @@ EXECUTION_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_MESSAGES = 0
 ARMING_ARGUMENT = "--confirm-continuous-paper"
 RECOVERY_ARGUMENT = "--recover-reserved-exit"
+SUPPORTED_EAGLE_SYMBOL = "BTCUSDT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +232,36 @@ def refresh_position_snapshot(
         description="IB position snapshot completion",
         timeout_seconds=CONNECTION_TIMEOUT_SECONDS,
     )
+
+
+def get_relevant_btc_eagle_open_positions(
+    open_positions: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
+    """Return Eagle hello open positions relevant to the BTC-only runner.
+
+    Valid non-BTC positions are intentionally ignored. Any open-position
+    snapshot whose symbol is missing, blank, or non-string is ambiguous and
+    therefore fails closed.
+    """
+
+    relevant_positions: list[dict[str, object]] = []
+
+    for position in open_positions:
+        raw_symbol = position.get("symbol")
+
+        if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+            raise RuntimeError(
+                "Eagle hello open position must contain a non-empty "
+                "string symbol; startup safety cannot classify this position."
+            )
+
+        normalized_symbol = raw_symbol.strip().upper()
+
+        if normalized_symbol == SUPPORTED_EAGLE_SYMBOL:
+            relevant_positions.append(position)
+
+    return tuple(relevant_positions)
+
 
 
 def get_mbt_position(broker_client: IBBrokerClient) -> int:
@@ -1074,9 +1105,21 @@ async def run_continuous_paper_trader(
                         "non-LIVE Eagle environment."
                     )
 
-                if message.open_count != 0:
+                relevant_eagle_open_positions = (
+                    get_relevant_btc_eagle_open_positions(
+                        message.open_positions
+                    )
+                )
+
+                print(
+                    "Relevant BTC Eagle opens: "
+                    f"{len(relevant_eagle_open_positions)}"
+                )
+
+                if relevant_eagle_open_positions:
                     raise RuntimeError(
                         "Continuous paper trader will not arm when Eagle hello "
+                        "contains a relevant BTCUSDT open position; raw "
                         "open_count is non-zero."
                     )
 

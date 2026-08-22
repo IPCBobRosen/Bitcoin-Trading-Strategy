@@ -50,6 +50,7 @@ from scripts.run_real_eagle_ib_paper_trader import (
     expected_position_after_trade,
     find_reserved_exit,
     get_mbt_position,
+    get_relevant_btc_eagle_open_positions,
     load_durable_open_signals,
     reconcile_broker_and_lifecycle,
     require_execution_state_clear,
@@ -1954,4 +1955,206 @@ def test_recovery_reconciles_fresh_broker_state_after_fill() -> None:
         fill_wait_index
         < refresh_index
         < reconcile_index
+    )
+
+def test_eagle_hello_empty_open_snapshot_has_no_relevant_btc() -> None:
+    """Empty Eagle hello snapshot should contain no relevant BTC opens."""
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        ()
+    )
+
+    assert relevant == ()
+
+
+def test_eagle_hello_eth_open_is_ignored_by_btc_only_runner() -> None:
+    """Valid ETH open signal must not block the BTC-only BTS runner."""
+
+    open_positions = (
+        {
+            "signal_id": "eth-signal-001",
+            "symbol": "ETHUSDT",
+            "direction": "long",
+        },
+    )
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        open_positions
+    )
+
+    assert relevant == ()
+
+
+def test_eagle_hello_btc_open_is_relevant() -> None:
+    """BTCUSDT open signal must remain visible to startup safety."""
+
+    btc_position = {
+        "signal_id": "btc-signal-001",
+        "symbol": "BTCUSDT",
+        "direction": "long",
+    }
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        (btc_position,)
+    )
+
+    assert relevant == (
+        btc_position,
+    )
+
+
+def test_eagle_hello_mixed_snapshot_returns_only_btc() -> None:
+    """Mixed Eagle snapshot must filter out unsupported instruments."""
+
+    eth_position = {
+        "signal_id": "eth-signal-001",
+        "symbol": "ETHUSDT",
+        "direction": "long",
+    }
+
+    btc_position = {
+        "signal_id": "btc-signal-001",
+        "symbol": "BTCUSDT",
+        "direction": "short",
+    }
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        (
+            eth_position,
+            btc_position,
+        )
+    )
+
+    assert relevant == (
+        btc_position,
+    )
+
+
+def test_eagle_hello_symbol_matching_is_normalized() -> None:
+    """Startup filtering should use the same normalized symbol convention."""
+
+    btc_position = {
+        "signal_id": "btc-signal-001",
+        "symbol": "  btcusdt  ",
+        "direction": "long",
+    }
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        (btc_position,)
+    )
+
+    assert relevant == (
+        btc_position,
+    )
+
+
+def test_eagle_hello_missing_symbol_fails_closed() -> None:
+    """Ambiguous Eagle open position must never be silently ignored."""
+
+    open_positions = (
+        {
+            "signal_id": "unknown-signal-001",
+            "direction": "long",
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="symbol",
+    ):
+        get_relevant_btc_eagle_open_positions(
+            open_positions
+        )
+
+
+def test_eagle_hello_blank_symbol_fails_closed() -> None:
+    """Blank Eagle symbol must fail closed during startup filtering."""
+
+    open_positions = (
+        {
+            "signal_id": "unknown-signal-001",
+            "symbol": "   ",
+            "direction": "long",
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="symbol",
+    ):
+        get_relevant_btc_eagle_open_positions(
+            open_positions
+        )
+
+
+def test_eagle_hello_non_string_symbol_fails_closed() -> None:
+    """Non-string Eagle symbol must fail closed."""
+
+    open_positions = (
+        {
+            "signal_id": "unknown-signal-001",
+            "symbol": 123,
+            "direction": "long",
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="symbol",
+    ):
+        get_relevant_btc_eagle_open_positions(
+            open_positions
+        )
+
+
+def test_runner_does_not_gate_startup_on_raw_eagle_open_count() -> None:
+    """Startup safety must evaluate relevant BTC opens, not global count."""
+
+    source = script_source()
+
+    assert (
+        "if message.open_count != 0:"
+        not in source
+    )
+
+
+def test_runner_filters_eagle_hello_open_positions_for_btc() -> None:
+    """Runner must explicitly filter Eagle hello opens for BTCUSDT."""
+
+    source = script_source()
+
+    assert (
+        "get_relevant_btc_eagle_open_positions("
+        in source
+    )
+
+    assert (
+        "message.open_positions"
+        in source
+    )
+
+
+def test_runner_rejects_relevant_btc_eagle_open_at_startup() -> None:
+    """A relevant BTC Eagle open must prevent normal trader arming."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "get_relevant_btc_eagle_open_positions("
+    )
+
+    relevant_guard_index = source.index(
+        "if relevant_eagle_open_positions:",
+        helper_index,
+    )
+
+    runtime_error_index = source.index(
+        "raise RuntimeError(",
+        relevant_guard_index,
+    )
+
+    assert (
+        helper_index
+        < relevant_guard_index
+        < runtime_error_index
     )
