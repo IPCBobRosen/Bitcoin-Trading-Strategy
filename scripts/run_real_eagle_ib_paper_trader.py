@@ -891,6 +891,28 @@ async def run_continuous_paper_trader(
                         TradeIntent.SELL_TO_OPEN,
                     }:
                         if broker_position != 0 or open_signals:
+                            if armed:
+                                event_result = event_processor.process(message)
+                                print(f"Event status: {event_result.status.value}")
+
+                                if (
+                                    event_result.status
+                                    is not EventProcessStatus.ACCEPTED
+                                ):
+                                    print(
+                                        "Duplicate/out-of-sequence live event "
+                                        "stopped before second-entry skip handling."
+                                    )
+                                    continue
+
+                                rejected_decisions += 1
+
+                                print("Opening signal skipped because BTS/broker is already positioned.")
+                                print("No durable lifecycle was created for this signal.")
+                                print("No broker order was submitted.")
+                                print("Continuous trader remains active.")
+                                continue
+
                             raise RuntimeError(
                                 "Live opening signal blocked because BTS/broker "
                                 "is not flat."

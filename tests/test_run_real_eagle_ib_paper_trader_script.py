@@ -1393,3 +1393,77 @@ def test_armed_live_path_runs_risk_before_lifecycle_mutation() -> None:
         < risk_index
         < commit_index
     )
+
+def test_already_positioned_opening_signal_is_nonfatal_skip() -> None:
+    """Second Eagle entry at max position must not kill continuous trader."""
+
+    source = script_source()
+
+    expected_message = (
+        "Opening signal skipped because BTS/broker "
+        "is already positioned."
+    )
+
+    assert expected_message in source
+
+    positioned_guard_index = source.index(
+        "if broker_position != 0 or open_signals:"
+    )
+
+    skip_message_index = source.index(
+        expected_message,
+        positioned_guard_index,
+    )
+
+    continue_index = source.index(
+        "continue",
+        skip_message_index,
+    )
+
+    next_runtime_error_index = source.find(
+        "raise RuntimeError(",
+        positioned_guard_index,
+    )
+
+    assert continue_index > skip_message_index
+
+    assert (
+        next_runtime_error_index == -1
+        or continue_index < next_runtime_error_index
+    )
+
+def test_skipped_second_entry_is_durably_consumed_before_continue() -> None:
+    """Skipped max-position entry must advance durable Eagle processing."""
+
+    source = script_source()
+
+    positioned_guard_index = source.index(
+        "if broker_position != 0 or open_signals:"
+    )
+
+    event_process_index = source.index(
+        "event_processor.process(message)",
+        positioned_guard_index,
+    )
+
+    skip_message_index = source.index(
+        "Opening signal skipped because BTS/broker is already positioned.",
+        positioned_guard_index,
+    )
+
+    continue_index = source.index(
+        "continue",
+        skip_message_index,
+    )
+
+    commit_index = source.index(
+        "coordinator.commit_request(",
+        positioned_guard_index,
+    )
+
+    assert (
+        event_process_index
+        < skip_message_index
+        < continue_index
+        < commit_index
+    )
