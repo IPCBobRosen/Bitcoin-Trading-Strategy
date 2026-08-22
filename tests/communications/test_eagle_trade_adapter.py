@@ -668,3 +668,114 @@ def test_unsupported_message_type_is_rejected(
         adapter.adapt(
             event
         )
+
+def test_rejected_second_entry_exit_does_not_close_executed_signal(
+    tmp_path: Path,
+) -> None:
+    """Exit for unexecuted Signal B must not close executed Signal A."""
+
+    guard = SignalLifecycleGuard(
+        tmp_path / "signals.db"
+    )
+
+    coordinator = create_coordinator(
+        guard
+    )
+
+    adapter = EagleTradeAdapter(
+        guard
+    )
+
+    signal_a = "signal-a-executed"
+    signal_b = "signal-b-rejected"
+
+    # Signal A is the entry BTS actually accepts.
+    entry_a = adapter.adapt(
+        create_real_entry(
+            direction="long",
+            signal_id=signal_a,
+            event_id=f"{signal_a}:entry",
+            seq=1,
+        )
+    )
+
+    assert entry_a.event is not None
+
+    assert (
+        coordinator.process_event(
+            entry_a.event
+        ).approved
+        is True
+    )
+
+    assert (
+        guard.get_state(signal_a)
+        is SignalLifecycleState.LONG_OPEN
+    )
+
+    # Signal B arrives, but represents the second entry that BTS
+    # does NOT commit because broker exposure is already at max.
+    entry_b = adapter.adapt(
+        create_real_entry(
+            direction="long",
+            signal_id=signal_b,
+            event_id=f"{signal_b}:entry",
+            seq=2,
+        )
+    )
+
+    assert entry_b.adapted is True
+    assert entry_b.event is not None
+
+    # Simulate the LIVE runner rejecting Signal B BEFORE
+    # coordinator.commit_request() is called.
+    prepared_b = coordinator.prepare_event(
+        entry_b.event
+    )
+
+    assert prepared_b.approved is True
+    assert prepared_b.trade_request is not None
+
+    # Signal B must have no executable lifecycle.
+    assert guard.get_state(signal_b) is None
+
+    # Eagle exits Signal B first.
+    exit_b = adapter.adapt(
+        create_real_exit(
+            signal_id=signal_b,
+            event_id=f"{signal_b}:exit",
+            seq=3,
+        )
+    )
+
+    assert exit_b.adapted is False
+
+    assert (
+        exit_b.status
+        is EagleTradeAdaptStatus.IGNORED_UNKNOWN_EXIT
+    )
+
+    assert exit_b.event is None
+
+    # Most importantly, ignoring B's exit must not affect A.
+    assert (
+        guard.get_state(signal_a)
+        is SignalLifecycleState.LONG_OPEN
+    )
+
+    # Eagle later exits Signal A.
+    exit_a = adapter.adapt(
+        create_real_exit(
+            signal_id=signal_a,
+            event_id=f"{signal_a}:exit",
+            seq=4,
+        )
+    )
+
+    assert exit_a.adapted is True
+    assert exit_a.event is not None
+
+    assert (
+        exit_a.event.payload["intent"]
+        == TradeIntent.SELL_TO_CLOSE.value
+    )

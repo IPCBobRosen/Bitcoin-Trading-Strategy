@@ -17,6 +17,9 @@ from app.trade_coordinator import (
     TradeCoordinator,
 )
 from app.trading_controls import TradingControls
+from app.daily_loss_guard import DailyLossGuard
+from app.kill_switch import KillSwitch
+from app.risk_manager import RiskManager
 
 
 def create_test_event(
@@ -608,4 +611,154 @@ def test_lifecycle_state_survives_coordinator_restart(
             "test-signal-001"
         )
         is SignalLifecycleState.CLOSED
+    )
+
+def test_prepare_event_creates_request_without_mutating_lifecycle(
+    tmp_path,
+) -> None:
+    """Preparing a trade must not mutate durable signal lifecycle."""
+
+    coordinator = create_coordinator(
+        tmp_path,
+        resume=True,
+    )
+
+    event = create_test_event(
+        event_id="prepared-entry-001",
+        signal_id="prepared-signal-001",
+        seq=1,
+        intent="BUY_TO_OPEN",
+    )
+
+    decision = coordinator.prepare_event(
+        event
+    )
+
+    assert decision.approved is True
+    assert decision.reason == APPROVED
+    assert decision.trade_request is not None
+
+    assert (
+        coordinator.signal_lifecycle_guard.get_state(
+            event.signal_id
+        )
+        is None
+    )
+
+
+def test_commit_request_mutates_lifecycle_after_preparation(
+    tmp_path,
+) -> None:
+    """A prepared request may commit lifecycle after external approval."""
+
+    coordinator = create_coordinator(
+        tmp_path,
+        resume=True,
+    )
+
+    event = create_test_event(
+        event_id="prepared-entry-001",
+        signal_id="prepared-signal-001",
+        seq=1,
+        intent="BUY_TO_OPEN",
+    )
+
+    prepared = coordinator.prepare_event(
+        event
+    )
+
+    assert prepared.trade_request is not None
+
+    committed = coordinator.commit_request(
+        prepared.trade_request
+    )
+
+    assert committed.approved is True
+    assert committed.reason == APPROVED
+    assert committed.trade_request is not None
+
+    assert (
+        coordinator.signal_lifecycle_guard.get_state(
+            event.signal_id
+        )
+        is SignalLifecycleState.LONG_OPEN
+    )
+
+def test_kill_switch_rejection_leaves_lifecycle_unmodified(
+    tmp_path,
+) -> None:
+    """Rejected opening trade must not create durable open lifecycle."""
+
+    controls = create_controls()
+    controls.resume()
+
+    lifecycle_guard = SignalLifecycleGuard(
+        tmp_path
+        / "signal_lifecycle.db"
+    )
+
+    coordinator = TradeCoordinator(
+        controls,
+        lifecycle_guard,
+    )
+
+    kill_switch = KillSwitch()
+
+    risk_manager = RiskManager(
+        controls,
+        kill_switch,
+        DailyLossGuard(
+            Decimal("1000")
+        ),
+        allowed_symbols=("MBT",),
+        max_order_quantity=1,
+        max_absolute_position=1,
+    )
+
+    event = create_test_event(
+        event_id="kill-switch-entry-001",
+        signal_id="kill-switch-signal-001",
+        seq=1,
+        intent="BUY_TO_OPEN",
+    )
+
+    prepared = coordinator.prepare_event(
+        event
+    )
+
+    assert prepared.approved is True
+    assert prepared.trade_request is not None
+
+    # Preparation itself must not mutate lifecycle.
+    assert (
+        lifecycle_guard.get_state(
+            event.signal_id
+        )
+        is None
+    )
+
+    kill_switch.activate(
+        "IB error 1100: Connectivity between "
+        "IBKR and Trader Workstation has been lost."
+    )
+
+    risk_decision = risk_manager.evaluate(
+        prepared.trade_request,
+        current_position=0,
+    )
+
+    assert risk_decision.approved is False
+    assert (
+        "Emergency kill switch is active"
+        in risk_decision.reason
+    )
+
+    # Most important regression assertion:
+    # rejected risk means commit_request() was never reached,
+    # therefore BTS must still have no durable open lifecycle.
+    assert (
+        lifecycle_guard.get_state(
+            event.signal_id
+        )
+        is None
     )

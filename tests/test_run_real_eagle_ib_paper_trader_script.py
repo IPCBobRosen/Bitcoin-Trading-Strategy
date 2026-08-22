@@ -40,11 +40,15 @@ from scripts.run_real_eagle_ib_paper_trader import (
     MAX_ABSOLUTE_POSITION,
     MAX_ORDER_QUANTITY,
     PAPER_QUANTITY,
+    RECOVERY_ARGUMENT,
     SYMBOL,
     DurableOpenSignal,
+    ReservedExitRecoveryDecision,
+    evaluate_reserved_exit_recovery,
     execution_state_clear,
     expected_ib_action,
     expected_position_after_trade,
+    find_reserved_exit,
     get_mbt_position,
     load_durable_open_signals,
     reconcile_broker_and_lifecycle,
@@ -1112,7 +1116,7 @@ def test_script_rejects_nonzero_eagle_open_count() -> None:
 
 
 def test_script_has_observe_only_boundary_before_coordinator() -> None:
-    """Unarmed live mode must stop before TradeCoordinator mutation."""
+    """Unarmed live mode must stop before TradeCoordinator preparation."""
 
     source = script_source()
 
@@ -1120,15 +1124,12 @@ def test_script_has_observe_only_boundary_before_coordinator() -> None:
         "# OBSERVE-ONLY HARD BOUNDARY"
     )
 
-    coordinator_index = source.index(
-        "coordinator.process_event(",
+    prepare_index = source.index(
+        "coordinator.prepare_event(",
         boundary_index,
     )
 
-    assert (
-        boundary_index
-        < coordinator_index
-    )
+    assert boundary_index < prepare_index
 
 
 def test_script_unarmed_boundary_uses_continue() -> None:
@@ -1366,3 +1367,591 @@ def test_script_does_not_embed_api_key() -> None:
 
     assert "Bearer " not in source
     assert "SUPER-SECRET" not in source
+
+def test_armed_live_path_runs_risk_before_lifecycle_mutation() -> None:
+    """Risk approval must occur before durable lifecycle commit."""
+
+    source = script_source()
+
+    armed_path_index = source.index(
+        "# Armed path begins here."
+    )
+
+    prepare_index = source.index(
+        "coordinator.prepare_event(",
+        armed_path_index,
+    )
+
+    risk_index = source.index(
+        "risk_manager.evaluate(",
+        armed_path_index,
+    )
+
+    commit_index = source.index(
+        "coordinator.commit_request(",
+        armed_path_index,
+    )
+
+    assert (
+        prepare_index
+        < risk_index
+        < commit_index
+    )
+
+def test_already_positioned_opening_signal_is_nonfatal_skip() -> None:
+    """Second Eagle entry at max position must not kill continuous trader."""
+
+    source = script_source()
+
+    expected_message = (
+        "Opening signal skipped because BTS/broker "
+        "is already positioned."
+    )
+
+    assert expected_message in source
+
+    positioned_guard_index = source.index(
+        "if broker_position != 0 or open_signals:"
+    )
+
+    skip_message_index = source.index(
+        expected_message,
+        positioned_guard_index,
+    )
+
+    continue_index = source.index(
+        "continue",
+        skip_message_index,
+    )
+
+    next_runtime_error_index = source.find(
+        "raise RuntimeError(",
+        positioned_guard_index,
+    )
+
+    assert continue_index > skip_message_index
+
+    assert (
+        next_runtime_error_index == -1
+        or continue_index < next_runtime_error_index
+    )
+
+def test_skipped_second_entry_is_durably_consumed_before_continue() -> None:
+    """Skipped max-position entry must advance durable Eagle processing."""
+
+    source = script_source()
+
+    positioned_guard_index = source.index(
+        "if broker_position != 0 or open_signals:"
+    )
+
+    event_process_index = source.index(
+        "event_processor.process(message)",
+        positioned_guard_index,
+    )
+
+    skip_message_index = source.index(
+        "Opening signal skipped because BTS/broker is already positioned.",
+        positioned_guard_index,
+    )
+
+    continue_index = source.index(
+        "continue",
+        skip_message_index,
+    )
+
+    commit_index = source.index(
+        "coordinator.commit_request(",
+        positioned_guard_index,
+    )
+
+    assert (
+        event_process_index
+        < skip_message_index
+        < continue_index
+        < commit_index
+    )
+
+def test_exit_is_reserved_before_readiness_and_lifecycle_commit() -> None:
+    """Exit obligation must survive broker-readiness failure."""
+
+    source = script_source()
+
+    durability_boundary_index = source.index(
+        "# EXIT-OBLIGATION DURABILITY BOUNDARY"
+    )
+
+    reserve_index = source.index(
+        "execution_client.reserve_execution(",
+        durability_boundary_index,
+    )
+
+    readiness_index = source.index(
+        "readiness.require_ready(",
+        reserve_index,
+    )
+
+    submit_reserved_index = source.index(
+        "execution_client.submit_reserved(",
+        readiness_index,
+    )
+
+    fill_wait_index = source.index(
+        "wait_for_execution_resolution(",
+        submit_reserved_index,
+    )
+
+    commit_index = source.index(
+        "coordinator.commit_request(",
+        fill_wait_index,
+    )
+
+    assert (
+        reserve_index
+        < readiness_index
+        < submit_reserved_index
+        < fill_wait_index
+        < commit_index
+    )
+
+def test_exit_obligation_is_reserved_before_broker_refresh() -> None:
+    """Matching live exit must become durable before BTS touches IB."""
+
+    source = script_source()
+
+    durability_boundary_index = source.index(
+        "# EXIT-OBLIGATION DURABILITY BOUNDARY"
+    )
+
+    event_process_index = source.index(
+        "event_result = event_processor.process(",
+        durability_boundary_index,
+    )
+
+    prepare_index = source.index(
+        "coordinator.prepare_event(",
+        event_process_index,
+    )
+
+    reserve_index = source.index(
+        "execution_client.reserve_execution(",
+        prepare_index,
+    )
+
+    refresh_index = source.index(
+        "refresh_position_snapshot(",
+        reserve_index,
+    )
+
+    assert (
+        durability_boundary_index
+        < event_process_index
+        < prepare_index
+        < reserve_index
+        < refresh_index
+    )
+
+
+def test_exit_lifecycle_commit_occurs_only_after_confirmed_fill() -> None:
+    """Close lifecycle must remain open until the broker confirms the exit fill."""
+
+    source = script_source()
+
+    durability_boundary_index = source.index(
+        "# EXIT-OBLIGATION DURABILITY BOUNDARY"
+    )
+
+    submit_index = source.index(
+        "execution_client.submit_reserved(",
+        durability_boundary_index,
+    )
+
+    fill_wait_index = source.index(
+        "wait_for_execution_resolution(",
+        submit_index,
+    )
+
+    commit_index = source.index(
+        "coordinator.commit_request(",
+        durability_boundary_index,
+    )
+
+    assert (
+        submit_index
+        < fill_wait_index
+        < commit_index
+    )
+
+def test_reserved_exit_recovery_requires_explicit_argument() -> None:
+    """Pending exit recovery must require separate operator authorization."""
+
+    assert RECOVERY_ARGUMENT == "--recover-reserved-exit"
+
+
+def test_find_reserved_exit_returns_matching_close(
+    tmp_path: Path,
+) -> None:
+    """Exactly one RESERVED closing execution should be discoverable."""
+
+    ledger = ExecutionLedger(
+        tmp_path / "execution.db"
+    )
+
+    request = build_trade_request(
+        intent=TradeIntent.SELL_TO_CLOSE,
+        signal_id="signal-a",
+    )
+
+    ledger.reserve(request)
+
+    record = find_reserved_exit(ledger)
+
+    assert record is not None
+    assert record.event_id == request.event_id
+    assert record.signal_id == "signal-a"
+    assert record.intent is TradeIntent.SELL_TO_CLOSE
+    assert record.status is ExecutionStatus.RESERVED
+
+
+def test_find_reserved_exit_rejects_reserved_open(
+    tmp_path: Path,
+) -> None:
+    """Recovery mode must never recover a missed opening order."""
+
+    ledger = ExecutionLedger(
+        tmp_path / "execution.db"
+    )
+
+    request = build_trade_request(
+        intent=TradeIntent.BUY_TO_OPEN,
+        signal_id="signal-a",
+    )
+
+    ledger.reserve(request)
+
+    with pytest.raises(
+        RuntimeError,
+        match="opening",
+    ):
+        find_reserved_exit(ledger)
+
+
+def test_matching_reserved_long_exit_is_recoverable() -> None:
+    """SELL_TO_CLOSE may recover only against matching +1 LONG_OPEN."""
+
+    request = build_trade_request(
+        intent=TradeIntent.SELL_TO_CLOSE,
+        signal_id="signal-a",
+    )
+
+    open_signal = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    decision = evaluate_reserved_exit_recovery(
+        trade_request=request,
+        broker_position=1,
+        open_signals=(open_signal,),
+        recovery_authorized=True,
+    )
+
+    assert isinstance(
+        decision,
+        ReservedExitRecoveryDecision,
+    )
+    assert decision.allowed is True
+
+
+def test_matching_reserved_short_exit_is_recoverable() -> None:
+    """BUY_TO_CLOSE may recover only against matching -1 SHORT_OPEN."""
+
+    request = build_trade_request(
+        intent=TradeIntent.BUY_TO_CLOSE,
+        signal_id="signal-a",
+    )
+
+    open_signal = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.SHORT_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    decision = evaluate_reserved_exit_recovery(
+        trade_request=request,
+        broker_position=-1,
+        open_signals=(open_signal,),
+        recovery_authorized=True,
+    )
+
+    assert decision.allowed is True
+
+
+def test_reserved_exit_recovery_rejects_flat_broker() -> None:
+    """Already-flat broker must never receive another closing order."""
+
+    request = build_trade_request(
+        intent=TradeIntent.SELL_TO_CLOSE,
+        signal_id="signal-a",
+    )
+
+    open_signal = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    decision = evaluate_reserved_exit_recovery(
+        trade_request=request,
+        broker_position=0,
+        open_signals=(open_signal,),
+        recovery_authorized=True,
+    )
+
+    assert decision.allowed is False
+    assert "flat" in decision.reason.lower()
+
+
+def test_reserved_exit_recovery_rejects_wrong_side() -> None:
+    """A closing recovery must fail against opposite broker exposure."""
+
+    request = build_trade_request(
+        intent=TradeIntent.SELL_TO_CLOSE,
+        signal_id="signal-a",
+    )
+
+    open_signal = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    decision = evaluate_reserved_exit_recovery(
+        trade_request=request,
+        broker_position=-1,
+        open_signals=(open_signal,),
+        recovery_authorized=True,
+    )
+
+    assert decision.allowed is False
+
+
+def test_reserved_exit_recovery_rejects_wrong_signal_id() -> None:
+    """Reserved exit must belong to the exact durable open signal."""
+
+    request = build_trade_request(
+        intent=TradeIntent.SELL_TO_CLOSE,
+        signal_id="signal-b",
+    )
+
+    open_signal = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    decision = evaluate_reserved_exit_recovery(
+        trade_request=request,
+        broker_position=1,
+        open_signals=(open_signal,),
+        recovery_authorized=True,
+    )
+
+    assert decision.allowed is False
+
+
+def test_reserved_exit_recovery_rejects_without_authorization() -> None:
+    """Perfectly matching state still requires explicit operator approval."""
+
+    request = build_trade_request(
+        intent=TradeIntent.SELL_TO_CLOSE,
+        signal_id="signal-a",
+    )
+
+    open_signal = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    decision = evaluate_reserved_exit_recovery(
+        trade_request=request,
+        broker_position=1,
+        open_signals=(open_signal,),
+        recovery_authorized=False,
+    )
+
+    assert decision.allowed is False
+    assert "authorization" in decision.reason.lower()
+
+
+def test_recovery_argument_is_wired_into_argument_parser() -> None:
+    """Recovery authorization must be an explicit command-line switch."""
+
+    source = script_source()
+
+    parser_index = source.index(
+        "def parse_arguments("
+    )
+
+    recovery_argument_index = source.index(
+        "RECOVERY_ARGUMENT",
+        parser_index,
+    )
+
+    assert recovery_argument_index > parser_index
+
+
+def test_recovery_path_is_separate_from_normal_live_event_path() -> None:
+    """Startup recovery must have an explicit auditable code boundary."""
+
+    source = script_source()
+
+    assert (
+        "# RESERVED-EXIT RECOVERY BOUNDARY"
+        in source
+    )
+
+
+def test_recovery_checks_state_before_submit_reserved() -> None:
+    """Recovery decision must be approved before any recovered broker call."""
+
+    source = script_source()
+
+    boundary_index = source.index(
+        "# RESERVED-EXIT RECOVERY BOUNDARY"
+    )
+
+    find_index = source.index(
+        "find_reserved_exit(",
+        boundary_index,
+    )
+
+    evaluate_index = source.index(
+        "evaluate_reserved_exit_recovery(",
+        find_index,
+    )
+
+    submit_index = source.index(
+        "execution_client.submit_reserved(",
+        evaluate_index,
+    )
+
+    assert (
+        boundary_index
+        < find_index
+        < evaluate_index
+        < submit_index
+    )
+
+
+def test_recovery_submission_occurs_exactly_once_in_recovery_boundary() -> None:
+    """One approved RESERVED exit must have one recovery submission site."""
+
+    source = script_source()
+
+    boundary_index = source.index(
+        "# RESERVED-EXIT RECOVERY BOUNDARY"
+    )
+
+    live_loop_index = source.index(
+        "async for message in eagle_client.listen():",
+        boundary_index,
+    )
+
+    recovery_text = source[
+        boundary_index:
+        live_loop_index
+    ]
+
+    assert (
+        recovery_text.count(
+            "execution_client.submit_reserved("
+        )
+        == 1
+    )
+
+
+def test_recovery_waits_for_execution_resolution_after_submission() -> None:
+    """Recovered exit must reach a known broker resolution before lifecycle close."""
+
+    source = script_source()
+
+    boundary_index = source.index(
+        "# RESERVED-EXIT RECOVERY BOUNDARY"
+    )
+
+    submit_index = source.index(
+        "execution_client.submit_reserved(",
+        boundary_index,
+    )
+
+    fill_wait_index = source.index(
+        "wait_for_execution_resolution(",
+        submit_index,
+    )
+
+    assert submit_index < fill_wait_index
+
+
+def test_recovery_commits_lifecycle_only_after_confirmed_fill() -> None:
+    """Recovered exit must not close lifecycle before broker fill confirmation."""
+
+    source = script_source()
+
+    boundary_index = source.index(
+        "# RESERVED-EXIT RECOVERY BOUNDARY"
+    )
+
+    submit_index = source.index(
+        "execution_client.submit_reserved(",
+        boundary_index,
+    )
+
+    fill_wait_index = source.index(
+        "wait_for_execution_resolution(",
+        submit_index,
+    )
+
+    commit_index = source.index(
+        "coordinator.commit_request(",
+        fill_wait_index,
+    )
+
+    assert (
+        submit_index
+        < fill_wait_index
+        < commit_index
+    )
+
+
+def test_recovery_reconciles_fresh_broker_state_after_fill() -> None:
+    """Recovered fill must be followed by a fresh broker position check."""
+
+    source = script_source()
+
+    boundary_index = source.index(
+        "# RESERVED-EXIT RECOVERY BOUNDARY"
+    )
+
+    fill_wait_index = source.index(
+        "wait_for_execution_resolution(",
+        boundary_index,
+    )
+
+    refresh_index = source.index(
+        "refresh_position_snapshot(",
+        fill_wait_index,
+    )
+
+    reconcile_index = source.index(
+        "reconcile_broker_and_lifecycle(",
+        refresh_index,
+    )
+
+    assert (
+        fill_wait_index
+        < refresh_index
+        < reconcile_index
+    )
