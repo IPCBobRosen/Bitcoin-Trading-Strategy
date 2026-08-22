@@ -1,7 +1,7 @@
 """Continuous real Eagle LIVE -> IB paper trader.
 
 Version 1 continuously listens for Eagle Fund signals and executes only
-BTCUSDT entry/exit lifecycle events as one-contract MBT paper orders.
+BTCUSDT entry/exit lifecycle events as operator-configured MBT paper orders.
 
 fund.update frames are recognized and logged, but stop/trailing-stop
 management is intentionally disabled in Version 1. Updates never create a
@@ -11,7 +11,8 @@ Safety rules:
 - Eagle environment must be live.
 - TWS paper endpoint only.
 - BTCUSDT -> MBT only.
-- Exactly 1 MBT; maximum absolute position 1; no pyramiding.
+- Operator explicitly selects MBT contract month, local symbol, and quantity.
+- Configurable quantity is capped at 10 MBT; no pyramiding.
 - Historical replay may update durable BTS state but can never submit to IB.
 - A post-replay heartbeat is required before live execution.
 - Broker/lifecycle/execution state must reconcile before each order.
@@ -68,17 +69,13 @@ IB_PORT = 7497
 IB_CLIENT_ID = 1
 
 SYMBOL = "MBT"
-EXPECTED_LOCAL_SYMBOL = "MBTQ6"
 EXCHANGE = "CME"
 CURRENCY = "USD"
 TRADING_CLASS = "MBT"
-CONTRACT_MONTH = "20260828"
 
-PAPER_QUANTITY = 1
+MAX_CONFIGURABLE_QUANTITY = 10
 STOP_LOSS_POINTS = Decimal("500")
 MAX_DAILY_LOSS = Decimal("1000")
-MAX_ORDER_QUANTITY = 1
-MAX_ABSOLUTE_POSITION = 1
 
 DEFAULT_EVENT_DATABASE = Path("data") / "real_eagle_live_events.db"
 DEFAULT_LIFECYCLE_DATABASE = Path("data") / "real_eagle_live_signals.db"
@@ -89,6 +86,59 @@ EXECUTION_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_MESSAGES = 0
 ARMING_ARGUMENT = "--confirm-continuous-paper"
 RECOVERY_ARGUMENT = "--recover-reserved-exit"
+SUPPORTED_EAGLE_SYMBOL = "BTCUSDT"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeExecutionConfig:
+    """Validated operator-selected MBT execution configuration."""
+
+    contract_month: str
+    local_symbol: str
+    quantity: int
+
+
+def validate_runtime_execution_config(
+    *,
+    contract_month: str,
+    local_symbol: str,
+    quantity: int,
+) -> RuntimeExecutionConfig:
+    """Validate one explicit operator-selected execution configuration."""
+
+    if not isinstance(contract_month, str) or not contract_month.strip():
+        raise ValueError("'contract_month' must be a non-empty string.")
+
+    normalized_contract_month = contract_month.strip()
+    if (
+        not normalized_contract_month.isdigit()
+        or len(normalized_contract_month) not in {6, 8}
+    ):
+        raise ValueError(
+            "'contract_month' must contain 6 or 8 numeric characters."
+        )
+
+    if not isinstance(local_symbol, str) or not local_symbol.strip():
+        raise ValueError("'local_symbol' must be a non-empty string.")
+
+    normalized_local_symbol = local_symbol.strip().upper()
+
+    if (
+        not isinstance(quantity, int)
+        or isinstance(quantity, bool)
+        or quantity < 1
+        or quantity > MAX_CONFIGURABLE_QUANTITY
+    ):
+        raise ValueError(
+            "'quantity' must be an integer from 1 through "
+            f"{MAX_CONFIGURABLE_QUANTITY}."
+        )
+
+    return RuntimeExecutionConfig(
+        contract_month=normalized_contract_month,
+        local_symbol=normalized_local_symbol,
+        quantity=quantity,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,28 +283,108 @@ def refresh_position_snapshot(
     )
 
 
-def get_mbt_position(broker_client: IBBrokerClient) -> int:
-    """Return signed MBT position from completed broker snapshot."""
+def get_relevant_btc_eagle_open_positions(
+    open_positions: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
+    """Return Eagle hello open positions relevant to the BTC-only runner.
+
+    Valid non-BTC positions are intentionally ignored. Any open-position
+    snapshot whose symbol is missing, blank, or non-string is ambiguous and
+    therefore fails closed.
+    """
+
+    relevant_positions: list[dict[str, object]] = []
+
+    for position in open_positions:
+        raw_symbol = position.get("symbol")
+
+        if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+            raise RuntimeError(
+                "Eagle hello open position must contain a non-empty "
+                "string symbol; startup safety cannot classify this position."
+            )
+
+        normalized_symbol = raw_symbol.strip().upper()
+
+        if normalized_symbol == SUPPORTED_EAGLE_SYMBOL:
+            relevant_positions.append(position)
+
+    return tuple(relevant_positions)
+
+
+
+def get_mbt_position(
+    broker_client: IBBrokerClient,
+    *,
+    expected_local_symbol: str | None = None,
+) -> int:
+    """Return signed position for the operator-approved MBT contract.
+
+    IBBrokerClient exposes normalized RawBrokerPosition objects. Their
+    ``symbol`` field contains the broker-position identity, which may be the
+    root symbol (``MBT``) or the contract-local symbol (for example
+    ``MBTQ6``). The original IB callback's separate local_symbol field is not
+    preserved on RawBrokerPosition.
+    """
 
     if not isinstance(broker_client, IBBrokerClient):
         raise TypeError("'broker_client' must be an IBBrokerClient.")
+
+    normalized_expected = (
+        expected_local_symbol.strip().upper()
+        if isinstance(expected_local_symbol, str)
+        and expected_local_symbol.strip()
+        else None
+    )
+
+    if expected_local_symbol is not None and normalized_expected is None:
+        raise ValueError("'expected_local_symbol' must be a non-empty string.")
+
+    allowed_symbols = {SYMBOL}
+    if normalized_expected is not None:
+        allowed_symbols.add(normalized_expected)
 
     total = 0
 
     for position in broker_client.get_raw_positions():
         normalized_symbol = position.symbol.strip().upper()
-        if normalized_symbol in {SYMBOL, EXPECTED_LOCAL_SYMBOL}:
+
+        if normalized_symbol in allowed_symbols:
             total += position.quantity
 
     return total
 
 
-def require_no_other_broker_positions(broker_client: IBBrokerClient) -> None:
-    """Require the paper account to contain MBT only, or be flat."""
+def require_no_other_broker_positions(
+    broker_client: IBBrokerClient,
+    *,
+    expected_local_symbol: str | None = None,
+) -> None:
+    """Require the account to contain only the approved MBT contract, or be flat.
+
+    IBBrokerClient returns normalized RawBrokerPosition objects whose
+    ``symbol`` field may contain either ``MBT`` or the IB local symbol for the
+    approved contract.
+    """
+
+    normalized_expected = (
+        expected_local_symbol.strip().upper()
+        if isinstance(expected_local_symbol, str)
+        and expected_local_symbol.strip()
+        else None
+    )
+
+    if expected_local_symbol is not None and normalized_expected is None:
+        raise ValueError("'expected_local_symbol' must be a non-empty string.")
+
+    allowed_symbols = {SYMBOL}
+    if normalized_expected is not None:
+        allowed_symbols.add(normalized_expected)
 
     for position in broker_client.get_raw_positions():
         normalized_symbol = position.symbol.strip().upper()
-        if normalized_symbol not in {SYMBOL, EXPECTED_LOCAL_SYMBOL}:
+
+        if normalized_symbol not in allowed_symbols:
             raise RuntimeError(
                 "Continuous paper trader requires no unrelated broker positions."
             )
@@ -420,6 +550,7 @@ def evaluate_reserved_exit_recovery(
     broker_position: int,
     open_signals: tuple[DurableOpenSignal, ...],
     recovery_authorized: bool,
+    expected_quantity: int = 1,
 ) -> ReservedExitRecoveryDecision:
     """Determine whether a RESERVED exit is safe to recover.
 
@@ -460,11 +591,12 @@ def evaluate_reserved_exit_recovery(
             ),
         )
 
-    if trade_request.quantity != PAPER_QUANTITY:
+    if trade_request.quantity != expected_quantity:
         return ReservedExitRecoveryDecision(
             allowed=False,
             reason=(
-                "Reserved exit recovery permits exactly 1 MBT."
+                "Reserved exit recovery quantity does not match the "
+                f"approved runtime quantity {expected_quantity}."
             ),
         )
 
@@ -491,12 +623,12 @@ def evaluate_reserved_exit_recovery(
             ),
         )
 
-    if broker_position not in {-1, 1}:
+    if broker_position not in {-expected_quantity, expected_quantity}:
         return ReservedExitRecoveryDecision(
             allowed=False,
             reason=(
-                "Broker position is outside the permitted "
-                "-1/+1 MBT recovery state."
+                "Broker position is outside the permitted runtime recovery "
+                f"state +/-{expected_quantity} MBT."
             ),
         )
 
@@ -521,12 +653,12 @@ def evaluate_reserved_exit_recovery(
         )
 
     if intent is TradeIntent.SELL_TO_CLOSE:
-        if broker_position != 1:
+        if broker_position != expected_quantity:
             return ReservedExitRecoveryDecision(
                 allowed=False,
                 reason=(
                     "SELL_TO_CLOSE recovery requires broker "
-                    "position +1 MBT."
+                    f"position +{expected_quantity} MBT."
                 ),
             )
 
@@ -543,12 +675,12 @@ def evaluate_reserved_exit_recovery(
             )
 
     elif intent is TradeIntent.BUY_TO_CLOSE:
-        if broker_position != -1:
+        if broker_position != -expected_quantity:
             return ReservedExitRecoveryDecision(
                 allowed=False,
                 reason=(
                     "BUY_TO_CLOSE recovery requires broker "
-                    "position -1 MBT."
+                    f"position -{expected_quantity} MBT."
                 ),
             )
 
@@ -578,16 +710,33 @@ def reconcile_broker_and_lifecycle(
     *,
     broker_client: IBBrokerClient,
     lifecycle_database_path: str | Path,
+    expected_local_symbol: str | None = None,
+    expected_quantity: int = 1,
 ) -> tuple[int, tuple[DurableOpenSignal, ...]]:
     """Require TWS position and durable signal state to agree exactly."""
 
-    require_no_other_broker_positions(broker_client)
+    if (
+        not isinstance(expected_quantity, int)
+        or isinstance(expected_quantity, bool)
+        or expected_quantity < 1
+        or expected_quantity > MAX_CONFIGURABLE_QUANTITY
+    ):
+        raise ValueError("'expected_quantity' is outside the approved range.")
 
-    broker_position = get_mbt_position(broker_client)
+    require_no_other_broker_positions(
+        broker_client,
+        expected_local_symbol=expected_local_symbol,
+    )
 
-    if broker_position not in {-1, 0, 1}:
+    broker_position = get_mbt_position(
+        broker_client,
+        expected_local_symbol=expected_local_symbol,
+    )
+
+    if broker_position not in {-expected_quantity, 0, expected_quantity}:
         raise RuntimeError(
-            "Continuous paper trader permits broker MBT position only -1, 0, or +1."
+            "Continuous paper trader permits broker MBT position only flat or "
+            f"+/-{expected_quantity}."
         )
 
     open_signals = load_durable_open_signals(lifecycle_database_path)
@@ -614,20 +763,20 @@ def reconcile_broker_and_lifecycle(
     open_signal = open_signals[0]
 
     if (
-        broker_position == 1
+        broker_position == expected_quantity
         and open_signal.state is not SignalLifecycleState.LONG_OPEN
     ):
         raise RuntimeError(
-            "Position reconciliation mismatch: broker is +1 MBT but durable signal "
+            f"Position reconciliation mismatch: broker is +{expected_quantity} MBT but durable signal "
             "is not LONG_OPEN."
         )
 
     if (
-        broker_position == -1
+        broker_position == -expected_quantity
         and open_signal.state is not SignalLifecycleState.SHORT_OPEN
     ):
         raise RuntimeError(
-            "Position reconciliation mismatch: broker is -1 MBT but durable signal "
+            f"Position reconciliation mismatch: broker is -{expected_quantity} MBT but durable signal "
             "is not SHORT_OPEN."
         )
 
@@ -639,14 +788,18 @@ def validate_trade_request_against_position(
     trade_request,
     broker_position: int,
     open_signals: tuple[DurableOpenSignal, ...],
+    expected_quantity: int = 1,
 ) -> None:
     """Apply continuous-runner position/lifecycle policy."""
 
     if trade_request.symbol != SYMBOL:
         raise RuntimeError("Continuous paper trader permits MBT only.")
 
-    if trade_request.quantity != PAPER_QUANTITY:
-        raise RuntimeError("Continuous paper trader permits exactly 1 MBT.")
+    if trade_request.quantity != expected_quantity:
+        raise RuntimeError(
+            "TradeRequest quantity does not match approved runtime quantity "
+            f"{expected_quantity}."
+        )
 
     intent = trade_request.intent
 
@@ -660,9 +813,9 @@ def validate_trade_request_against_position(
         return
 
     if intent is TradeIntent.SELL_TO_CLOSE:
-        if broker_position != 1:
+        if broker_position != expected_quantity:
             raise RuntimeError(
-                "SELL_TO_CLOSE requires current broker position +1 MBT."
+                f"SELL_TO_CLOSE requires current broker position +{expected_quantity} MBT."
             )
         if len(open_signals) != 1:
             raise RuntimeError(
@@ -677,9 +830,9 @@ def validate_trade_request_against_position(
         return
 
     if intent is TradeIntent.BUY_TO_CLOSE:
-        if broker_position != -1:
+        if broker_position != -expected_quantity:
             raise RuntimeError(
-                "BUY_TO_CLOSE requires current broker position -1 MBT."
+                f"BUY_TO_CLOSE requires current broker position -{expected_quantity} MBT."
             )
         if len(open_signals) != 1:
             raise RuntimeError(
@@ -702,9 +855,9 @@ def expected_position_after_trade(trade_request) -> int:
     """Return expected broker MBT position after one filled request."""
 
     if trade_request.intent is TradeIntent.BUY_TO_OPEN:
-        return 1
+        return trade_request.quantity
     if trade_request.intent is TradeIntent.SELL_TO_OPEN:
-        return -1
+        return -trade_request.quantity
     if trade_request.intent in {TradeIntent.SELL_TO_CLOSE, TradeIntent.BUY_TO_CLOSE}:
         return 0
     raise RuntimeError("Unsupported TradeIntent.")
@@ -739,6 +892,7 @@ async def run_continuous_paper_trader(
     lifecycle_database_path: str | Path,
     execution_ledger_path: str | Path,
     max_messages: int,
+    execution_config: RuntimeExecutionConfig,
     recover_reserved_exit: bool = False,
 ) -> ContinuousPaperResult:
     """Run the continuous Eagle LIVE -> TWS paper trader."""
@@ -748,6 +902,9 @@ async def run_continuous_paper_trader(
 
     if not isinstance(recover_reserved_exit, bool):
         raise TypeError("'recover_reserved_exit' must be a bool.")
+
+    if not isinstance(execution_config, RuntimeExecutionConfig):
+        raise TypeError("'execution_config' must be a RuntimeExecutionConfig.")
 
     if (
         not isinstance(max_messages, int)
@@ -776,7 +933,7 @@ async def run_continuous_paper_trader(
     kill_switch = KillSwitch()
     trading_controls = TradingControls(
         symbol=SYMBOL,
-        quantity=PAPER_QUANTITY,
+        quantity=execution_config.quantity,
         stop_loss_points=STOP_LOSS_POINTS,
     )
     trading_controls.resume()
@@ -787,8 +944,8 @@ async def run_continuous_paper_trader(
         kill_switch,
         daily_loss_guard,
         allowed_symbols=(SYMBOL,),
-        max_order_quantity=MAX_ORDER_QUANTITY,
-        max_absolute_position=MAX_ABSOLUTE_POSITION,
+        max_order_quantity=execution_config.quantity,
+        max_absolute_position=execution_config.quantity,
     )
 
     coordinator = TradeCoordinator(
@@ -892,7 +1049,10 @@ async def run_continuous_paper_trader(
                     "RESERVED exit has no recoverable TradeRequest."
                 )
 
-            recovery_position = get_mbt_position(broker_client)
+            recovery_position = get_mbt_position(
+                broker_client,
+                expected_local_symbol=execution_config.local_symbol,
+            )
             recovery_open_signals = load_durable_open_signals(
                 lifecycle_database_path
             )
@@ -902,6 +1062,7 @@ async def run_continuous_paper_trader(
                 broker_position=recovery_position,
                 open_signals=recovery_open_signals,
                 recovery_authorized=recover_reserved_exit,
+                expected_quantity=execution_config.quantity,
             )
 
             print()
@@ -939,7 +1100,7 @@ async def run_continuous_paper_trader(
 
             recovery_submission = execution_client.submit_reserved(
                 recovery_trade_request,
-                contract_month=CONTRACT_MONTH,
+                contract_month=execution_config.contract_month,
                 broker_order_id=broker_order_id,
             )
             broker_submissions += 1
@@ -950,9 +1111,13 @@ async def run_continuous_paper_trader(
                     "Recovered IB order action does not match TradeRequest."
                 )
 
-            if recovery_submission.package.order.totalQuantity != 1:
+            if (
+                recovery_submission.package.order.totalQuantity
+                != execution_config.quantity
+            ):
                 raise RuntimeError(
-                    "Recovered IB order quantity is not exactly 1."
+                    "Recovered IB order quantity does not match approved "
+                    "runtime quantity."
                 )
 
             recovery_final_record = wait_for_execution_resolution(
@@ -993,6 +1158,8 @@ async def run_continuous_paper_trader(
                 reconcile_broker_and_lifecycle(
                     broker_client=broker_client,
                     lifecycle_database_path=lifecycle_database_path,
+                    expected_local_symbol=execution_config.local_symbol,
+                    expected_quantity=execution_config.quantity,
                 )
             )
 
@@ -1009,11 +1176,19 @@ async def run_continuous_paper_trader(
         starting_position, starting_open_signals = reconcile_broker_and_lifecycle(
             broker_client=broker_client,
             lifecycle_database_path=lifecycle_database_path,
+            expected_local_symbol=execution_config.local_symbol,
+            expected_quantity=execution_config.quantity,
         )
 
         print()
         print("CONTINUOUS PAPER TRADER PRE-FLIGHT")
         print("=" * 72)
+        print("APPROVED MBT EXECUTION CONFIGURATION")
+        print(f"Contract month:        {execution_config.contract_month}")
+        print(f"Expected local symbol: {execution_config.local_symbol}")
+        print(f"Order quantity:        {execution_config.quantity}")
+        print(f"Hard quantity ceiling: {MAX_CONFIGURABLE_QUANTITY}")
+        print("-" * 72)
         print(f"TWS API ready:             {app.api_ready.ready}")
         print(f"Next valid order ID:       {app.api_ready.next_valid_order_id}")
         print(f"Starting MBT position:     {starting_position}")
@@ -1037,7 +1212,7 @@ async def run_continuous_paper_trader(
         print("Historical replay orders: BLOCKED")
         print("Post-replay heartbeat required: YES")
         print("BTCUSDT -> MBT only")
-        print("Maximum absolute MBT position: 1")
+        print(f"Maximum absolute MBT position: {execution_config.quantity}")
         print("fund.update: recognized; stop management disabled")
 
         if armed:
@@ -1074,9 +1249,21 @@ async def run_continuous_paper_trader(
                         "non-LIVE Eagle environment."
                     )
 
-                if message.open_count != 0:
+                relevant_eagle_open_positions = (
+                    get_relevant_btc_eagle_open_positions(
+                        message.open_positions
+                    )
+                )
+
+                print(
+                    "Relevant BTC Eagle opens: "
+                    f"{len(relevant_eagle_open_positions)}"
+                )
+
+                if relevant_eagle_open_positions:
                     raise RuntimeError(
                         "Continuous paper trader will not arm when Eagle hello "
+                        "contains a relevant BTCUSDT open position; raw "
                         "open_count is non-zero."
                     )
 
@@ -1372,6 +1559,8 @@ async def run_continuous_paper_trader(
                             reconcile_broker_and_lifecycle(
                                 broker_client=broker_client,
                                 lifecycle_database_path=lifecycle_database_path,
+                                expected_local_symbol=execution_config.local_symbol,
+                                expected_quantity=execution_config.quantity,
                             )
                         )
 
@@ -1379,6 +1568,7 @@ async def run_continuous_paper_trader(
                             trade_request=trade_request,
                             broker_position=broker_position,
                             open_signals=open_signals,
+                            expected_quantity=execution_config.quantity,
                         )
 
                         risk_decision = risk_manager.evaluate(
@@ -1434,13 +1624,13 @@ async def run_continuous_paper_trader(
                         print(f"Eagle event: {trade_request.event_id}")
                         print(f"Signal ID:   {trade_request.signal_id}")
                         print(f"Intent:      {trade_request.intent.value}")
-                        print("Quantity:    1 MBT")
+                        print(f"Quantity:    {execution_config.quantity} MBT")
                         print(f"IB order ID: {broker_order_id}")
                         print("=" * 72)
 
                         submission = execution_client.submit_reserved(
                             trade_request,
-                            contract_month=CONTRACT_MONTH,
+                            contract_month=execution_config.contract_month,
                             broker_order_id=broker_order_id,
                         )
                         broker_submissions += 1
@@ -1451,9 +1641,12 @@ async def run_continuous_paper_trader(
                                 "IB order action does not match TradeRequest."
                             )
 
-                        if submission.package.order.totalQuantity != 1:
+                        if (
+                            submission.package.order.totalQuantity
+                            != execution_config.quantity
+                        ):
                             raise RuntimeError(
-                                "IB order quantity is not exactly 1."
+                                "IB order quantity does not match approved runtime quantity."
                             )
 
                         final_record = wait_for_execution_resolution(
@@ -1521,6 +1714,8 @@ async def run_continuous_paper_trader(
                             reconcile_broker_and_lifecycle(
                                 broker_client=broker_client,
                                 lifecycle_database_path=lifecycle_database_path,
+                                expected_local_symbol=execution_config.local_symbol,
+                                expected_quantity=execution_config.quantity,
                             )
                         )
 
@@ -1549,6 +1744,8 @@ async def run_continuous_paper_trader(
                     broker_position, open_signals = reconcile_broker_and_lifecycle(
                         broker_client=broker_client,
                         lifecycle_database_path=lifecycle_database_path,
+                        expected_local_symbol=execution_config.local_symbol,
+                        expected_quantity=execution_config.quantity,
                     )
 
                     require_execution_state_clear(execution_ledger)
@@ -1668,6 +1865,7 @@ async def run_continuous_paper_trader(
                         trade_request=trade_request,
                         broker_position=broker_position,
                         open_signals=open_signals,
+                        expected_quantity=execution_config.quantity,
                     )
 
                     risk_decision = risk_manager.evaluate(
@@ -1766,7 +1964,7 @@ async def run_continuous_paper_trader(
 
                         expected_state = (
                             SignalLifecycleState.LONG_OPEN
-                            if expected_position == 1
+                            if expected_position > 0
                             else SignalLifecycleState.SHORT_OPEN
                         )
 
@@ -1790,13 +1988,13 @@ async def run_continuous_paper_trader(
                     print(f"Eagle event: {trade_request.event_id}")
                     print(f"Signal ID:   {trade_request.signal_id}")
                     print(f"Intent:      {trade_request.intent.value}")
-                    print("Quantity:    1 MBT")
+                    print(f"Quantity:    {execution_config.quantity} MBT")
                     print(f"IB order ID: {broker_order_id}")
                     print("=" * 72)
 
                     submission = execution_client.submit(
                         trade_request,
-                        contract_month=CONTRACT_MONTH,
+                        contract_month=execution_config.contract_month,
                         broker_order_id=broker_order_id,
                     )
                     broker_submissions += 1
@@ -1807,8 +2005,13 @@ async def run_continuous_paper_trader(
                             "IB order action does not match TradeRequest."
                         )
 
-                    if submission.package.order.totalQuantity != 1:
-                        raise RuntimeError("IB order quantity is not exactly 1.")
+                    if (
+                        submission.package.order.totalQuantity
+                        != execution_config.quantity
+                    ):
+                        raise RuntimeError(
+                            "IB order quantity does not match approved runtime quantity."
+                        )
 
                     final_record = wait_for_execution_resolution(
                         execution_ledger=execution_ledger,
@@ -1871,6 +2074,8 @@ async def run_continuous_paper_trader(
         final_mbt_position, final_open_signals = reconcile_broker_and_lifecycle(
             broker_client=broker_client,
             lifecycle_database_path=lifecycle_database_path,
+            expected_local_symbol=execution_config.local_symbol,
+            expected_quantity=execution_config.quantity,
         )
 
         return ContinuousPaperResult(
@@ -1943,7 +2148,7 @@ def parse_arguments() -> argparse.Namespace:
         ARMING_ARGUMENT,
         action="store_true",
         dest="confirm_continuous_paper",
-        help="Explicitly authorize continuous 1-MBT TWS paper execution.",
+        help="Explicitly authorize continuous TWS paper execution.",
     )
     parser.add_argument(
         RECOVERY_ARGUMENT,
@@ -1952,6 +2157,25 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "Explicitly authorize recovery of one durable RESERVED "
             "MBT closing execution after operator review."
+        ),
+    )
+    parser.add_argument(
+        "--contract-month",
+        required=True,
+        help="Approved IB MBT futures expiry in YYYYMM or YYYYMMDD form.",
+    )
+    parser.add_argument(
+        "--local-symbol",
+        required=True,
+        help="Expected TWS local symbol for the approved MBT contract.",
+    )
+    parser.add_argument(
+        "--quantity",
+        required=True,
+        type=int,
+        help=(
+            "Approved MBT order quantity. Must be between 1 and "
+            f"{MAX_CONFIGURABLE_QUANTITY}."
         ),
     )
     parser.add_argument(
@@ -1984,6 +2208,18 @@ def main() -> int:
     armed = bool(arguments.confirm_continuous_paper)
     recover_reserved_exit = bool(arguments.recover_reserved_exit)
 
+    try:
+        execution_config = validate_runtime_execution_config(
+            contract_month=arguments.contract_month,
+            local_symbol=arguments.local_symbol,
+            quantity=arguments.quantity,
+        )
+    except (TypeError, ValueError) as error:
+        print()
+        print("CONTINUOUS PAPER TRADER FAIL-CLOSED")
+        print(f"Invalid execution configuration: {error}")
+        return 1
+
     print()
     print("Starting continuous Eagle -> IB PAPER trader...")
 
@@ -2002,6 +2238,7 @@ def main() -> int:
                 lifecycle_database_path=arguments.lifecycle_database,
                 execution_ledger_path=arguments.execution_ledger,
                 max_messages=arguments.max_messages,
+                execution_config=execution_config,
                 recover_reserved_exit=recover_reserved_exit,
             )
         )

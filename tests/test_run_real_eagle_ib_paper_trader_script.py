@@ -27,7 +27,6 @@ from app.signal_lifecycle_guard import (
 
 from scripts.run_real_eagle_ib_paper_trader import (
     ARMING_ARGUMENT,
-    CONTRACT_MONTH,
     DEFAULT_EVENT_DATABASE,
     DEFAULT_EXECUTION_LEDGER,
     DEFAULT_LIFECYCLE_DATABASE,
@@ -37,10 +36,9 @@ from scripts.run_real_eagle_ib_paper_trader import (
     IB_CLIENT_ID,
     IB_HOST,
     IB_PORT,
-    MAX_ABSOLUTE_POSITION,
-    MAX_ORDER_QUANTITY,
-    PAPER_QUANTITY,
+    MAX_CONFIGURABLE_QUANTITY,
     RECOVERY_ARGUMENT,
+    validate_runtime_execution_config,
     SYMBOL,
     DurableOpenSignal,
     ReservedExitRecoveryDecision,
@@ -50,6 +48,7 @@ from scripts.run_real_eagle_ib_paper_trader import (
     expected_position_after_trade,
     find_reserved_exit,
     get_mbt_position,
+    get_relevant_btc_eagle_open_positions,
     load_durable_open_signals,
     reconcile_broker_and_lifecycle,
     require_execution_state_clear,
@@ -221,28 +220,132 @@ def test_runner_trades_mbt_only() -> None:
     assert SYMBOL == "MBT"
 
 
-def test_runner_quantity_is_one() -> None:
-    """Continuous runner must use one contract."""
+def test_max_configurable_quantity_is_ten() -> None:
+    """Operator-selected MBT quantity must retain an independent hard ceiling."""
 
-    assert PAPER_QUANTITY == 1
-
-
-def test_max_order_quantity_is_one() -> None:
-    """Opening-order risk limit must remain one."""
-
-    assert MAX_ORDER_QUANTITY == 1
+    assert MAX_CONFIGURABLE_QUANTITY == 10
 
 
-def test_max_absolute_position_is_one() -> None:
-    """Pyramiding must remain disabled."""
+def test_runtime_config_accepts_one_contract() -> None:
+    """Current one-lot workflow must remain valid."""
 
-    assert MAX_ABSOLUTE_POSITION == 1
+    config = validate_runtime_execution_config(
+        contract_month="20260925",
+        local_symbol="MBTU6",
+        quantity=1,
+    )
+
+    assert config.contract_month == "20260925"
+    assert config.local_symbol == "MBTU6"
+    assert config.quantity == 1
 
 
-def test_contract_month_matches_paper_harness() -> None:
-    """Continuous runner must use proven MBT contract."""
+def test_runtime_config_accepts_five_contracts() -> None:
+    """Operator may explicitly choose a larger approved position."""
 
-    assert CONTRACT_MONTH == "20260828"
+    config = validate_runtime_execution_config(
+        contract_month="20260925",
+        local_symbol="MBTU6",
+        quantity=5,
+    )
+
+    assert config.quantity == 5
+
+
+def test_runtime_config_accepts_quantity_at_hard_ceiling() -> None:
+    """Ten MBT is the initial maximum configurable size."""
+
+    config = validate_runtime_execution_config(
+        contract_month="20260925",
+        local_symbol="MBTU6",
+        quantity=10,
+    )
+
+    assert config.quantity == 10
+
+
+def test_runtime_config_rejects_quantity_above_hard_ceiling() -> None:
+    """Quantity 11 must fail even if the operator requests it."""
+
+    with pytest.raises(
+        ValueError,
+        match="10",
+    ):
+        validate_runtime_execution_config(
+            contract_month="20260925",
+            local_symbol="MBTU6",
+            quantity=11,
+        )
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    [0, -1, True],
+)
+def test_runtime_config_rejects_invalid_quantity(quantity) -> None:
+    """Runtime MBT quantity must be an integer from 1 through 10."""
+
+    with pytest.raises(
+        ValueError,
+        match="quantity",
+    ):
+        validate_runtime_execution_config(
+            contract_month="20260925",
+            local_symbol="MBTU6",
+            quantity=quantity,
+        )
+
+
+@pytest.mark.parametrize(
+    "contract_month",
+    ["", "2026-09-25", "ABC", "2026092"],
+)
+def test_runtime_config_rejects_invalid_contract_month(
+    contract_month: str,
+) -> None:
+    """Execution contract must use an IB-compatible expiry identifier."""
+
+    with pytest.raises(
+        ValueError,
+        match="contract",
+    ):
+        validate_runtime_execution_config(
+            contract_month=contract_month,
+            local_symbol="MBTU6",
+            quantity=1,
+        )
+
+
+def test_runtime_config_normalizes_local_symbol() -> None:
+    """Expected TWS local symbol should be normalized for reconciliation."""
+
+    config = validate_runtime_execution_config(
+        contract_month="20260925",
+        local_symbol="  mbtu6  ",
+        quantity=1,
+    )
+
+    assert config.local_symbol == "MBTU6"
+
+
+@pytest.mark.parametrize(
+    "local_symbol",
+    ["", "   ", 123],
+)
+def test_runtime_config_rejects_invalid_local_symbol(
+    local_symbol,
+) -> None:
+    """Missing or malformed TWS contract identity must fail closed."""
+
+    with pytest.raises(
+        ValueError,
+        match="local_symbol",
+    ):
+        validate_runtime_execution_config(
+            contract_month="20260925",
+            local_symbol=local_symbol,
+            quantity=1,
+        )
 
 
 def test_default_message_limit_is_continuous() -> None:
@@ -286,7 +389,8 @@ def test_get_mbt_position_flat_snapshot() -> None:
 
     assert (
         get_mbt_position(
-            broker
+            broker,
+            expected_local_symbol="MBTQ6",
         )
         == 0
     )
@@ -308,7 +412,8 @@ def test_get_mbt_position_long_one() -> None:
 
     assert (
         get_mbt_position(
-            broker
+            broker,
+            expected_local_symbol="MBTQ6",
         )
         == 1
     )
@@ -330,7 +435,8 @@ def test_get_mbt_position_short_one() -> None:
 
     assert (
         get_mbt_position(
-            broker
+            broker,
+            expected_local_symbol="MBTQ6",
         )
         == -1
     )
@@ -346,7 +452,8 @@ def test_get_mbt_position_requires_completed_snapshot() -> None:
         match="position snapshot is not complete",
     ):
         get_mbt_position(
-            broker
+            broker,
+            expected_local_symbol="MBTQ6",
         )
 
 
@@ -356,7 +463,8 @@ def test_require_no_other_positions_accepts_flat() -> None:
     broker = build_completed_broker()
 
     require_no_other_broker_positions(
-        broker
+        broker,
+        expected_local_symbol="MBTQ6",
     )
 
 
@@ -375,7 +483,8 @@ def test_require_no_other_positions_accepts_mbt() -> None:
     )
 
     require_no_other_broker_positions(
-        broker
+        broker,
+        expected_local_symbol="MBTQ6",
     )
 
 
@@ -398,7 +507,8 @@ def test_require_no_other_positions_rejects_unrelated_contract() -> None:
         match="no unrelated broker positions",
     ):
         require_no_other_broker_positions(
-            broker
+            broker,
+            expected_local_symbol="MBTQ6",
         )
 
 
@@ -530,6 +640,7 @@ def test_reconcile_long_broker_and_long_lifecycle(
     position, signals = (
         reconcile_broker_and_lifecycle(
             broker_client=broker,
+            expected_local_symbol="MBTQ6",
             lifecycle_database_path=(
                 lifecycle_path
             ),
@@ -571,6 +682,7 @@ def test_reconcile_short_broker_and_short_lifecycle(
     position, signals = (
         reconcile_broker_and_lifecycle(
             broker_client=broker,
+            expected_local_symbol="MBTQ6",
             lifecycle_database_path=(
                 lifecycle_path
             ),
@@ -616,6 +728,7 @@ def test_reconcile_rejects_broker_position_without_open_signal(
     ):
         reconcile_broker_and_lifecycle(
             broker_client=broker,
+            expected_local_symbol="MBTQ6",
             lifecycle_database_path=(
                 lifecycle_path
             ),
@@ -679,6 +792,7 @@ def test_reconcile_rejects_long_broker_with_short_lifecycle(
     ):
         reconcile_broker_and_lifecycle(
             broker_client=broker,
+            expected_local_symbol="MBTQ6",
             lifecycle_database_path=(
                 lifecycle_path
             ),
@@ -715,6 +829,7 @@ def test_reconcile_rejects_short_broker_with_long_lifecycle(
     ):
         reconcile_broker_and_lifecycle(
             broker_client=broker,
+            expected_local_symbol="MBTQ6",
             lifecycle_database_path=(
                 lifecycle_path
             ),
@@ -820,6 +935,7 @@ def test_validate_buy_to_open_when_flat() -> None:
         trade_request=request,
         broker_position=0,
         open_signals=(),
+        expected_quantity=1,
     )
 
 
@@ -834,6 +950,7 @@ def test_validate_sell_to_open_when_flat() -> None:
         trade_request=request,
         broker_position=0,
         open_signals=(),
+        expected_quantity=1,
     )
 
 
@@ -860,6 +977,7 @@ def test_validate_open_rejected_while_positioned() -> None:
             open_signals=(
                 open_signal,
             ),
+            expected_quantity=1,
         )
 
 
@@ -883,6 +1001,7 @@ def test_validate_sell_to_close_matching_long() -> None:
         open_signals=(
             open_signal,
         ),
+        expected_quantity=1,
     )
 
 
@@ -906,6 +1025,7 @@ def test_validate_buy_to_close_matching_short() -> None:
         open_signals=(
             open_signal,
         ),
+        expected_quantity=1,
     )
 
 
@@ -933,6 +1053,7 @@ def test_validate_close_rejects_wrong_signal_id() -> None:
             open_signals=(
                 open_signal,
             ),
+            expected_quantity=1,
         )
 
 
@@ -952,11 +1073,28 @@ def test_validate_wrong_symbol_rejected() -> None:
             trade_request=request,
             broker_position=0,
             open_signals=(),
+            expected_quantity=1,
         )
 
 
-def test_validate_quantity_two_rejected() -> None:
-    """Continuous trader cannot submit two contracts."""
+def test_validate_trade_request_accepts_runtime_quantity() -> None:
+    """Trade validation should accept the operator-approved runtime quantity."""
+
+    request = build_trade_request(
+        intent=TradeIntent.BUY_TO_OPEN,
+        quantity=5,
+    )
+
+    validate_trade_request_against_position(
+        trade_request=request,
+        broker_position=0,
+        open_signals=(),
+        expected_quantity=5,
+    )
+
+
+def test_validate_trade_request_rejects_wrong_runtime_quantity() -> None:
+    """Trade quantity must exactly match the approved runtime quantity."""
 
     request = build_trade_request(
         intent=TradeIntent.BUY_TO_OPEN,
@@ -965,12 +1103,13 @@ def test_validate_quantity_two_rejected() -> None:
 
     with pytest.raises(
         RuntimeError,
-        match="exactly 1 MBT",
+        match="quantity",
     ):
         validate_trade_request_against_position(
             trade_request=request,
             broker_position=0,
             open_signals=(),
+            expected_quantity=5,
         )
 
 
@@ -1296,19 +1435,52 @@ def test_script_targets_paper_port_not_live_port() -> None:
     )
 
 
-def test_script_has_one_contract_risk_limits() -> None:
-    """Continuous runner must retain one-unit exposure limits."""
+def test_script_uses_runtime_quantity_for_controls_and_risk() -> None:
+    """One operator-selected quantity must drive every position-size guard."""
+
+    source = script_source()
+
+    assert "quantity=execution_config.quantity" in source
+    assert (
+        "max_order_quantity=execution_config.quantity"
+        in source
+    )
+    assert (
+        "max_absolute_position=execution_config.quantity"
+        in source
+    )
+
+
+def test_script_has_independent_quantity_ceiling() -> None:
+    """Runtime risk size must remain bounded independently of operator input."""
+
+    source = script_source()
+
+    assert "MAX_CONFIGURABLE_QUANTITY = 10" in source
+
+
+def test_script_does_not_hardcode_august_contract_for_submission() -> None:
+    """Broker submissions must use the approved runtime contract."""
+
+    source = script_source()
+
+    assert 'CONTRACT_MONTH = "20260828"' not in source
+    assert (
+        "contract_month=execution_config.contract_month"
+        in source
+    )
+
+
+def test_all_submission_paths_use_runtime_contract_month() -> None:
+    """Recovery, reserved-close, and normal paths must share one contract."""
 
     source = script_source()
 
     assert (
-        "MAX_ORDER_QUANTITY = 1"
-        in source
-    )
-
-    assert (
-        "MAX_ABSOLUTE_POSITION = 1"
-        in source
+        source.count(
+            "contract_month=execution_config.contract_month"
+        )
+        == 3
     )
 
 
@@ -1655,6 +1827,7 @@ def test_matching_reserved_long_exit_is_recoverable() -> None:
         broker_position=1,
         open_signals=(open_signal,),
         recovery_authorized=True,
+        expected_quantity=1,
     )
 
     assert isinstance(
@@ -1683,6 +1856,7 @@ def test_matching_reserved_short_exit_is_recoverable() -> None:
         broker_position=-1,
         open_signals=(open_signal,),
         recovery_authorized=True,
+        expected_quantity=1,
     )
 
     assert decision.allowed is True
@@ -1707,6 +1881,7 @@ def test_reserved_exit_recovery_rejects_flat_broker() -> None:
         broker_position=0,
         open_signals=(open_signal,),
         recovery_authorized=True,
+        expected_quantity=1,
     )
 
     assert decision.allowed is False
@@ -1732,6 +1907,7 @@ def test_reserved_exit_recovery_rejects_wrong_side() -> None:
         broker_position=-1,
         open_signals=(open_signal,),
         recovery_authorized=True,
+        expected_quantity=1,
     )
 
     assert decision.allowed is False
@@ -1756,6 +1932,7 @@ def test_reserved_exit_recovery_rejects_wrong_signal_id() -> None:
         broker_position=1,
         open_signals=(open_signal,),
         recovery_authorized=True,
+        expected_quantity=1,
     )
 
     assert decision.allowed is False
@@ -1780,6 +1957,7 @@ def test_reserved_exit_recovery_rejects_without_authorization() -> None:
         broker_position=1,
         open_signals=(open_signal,),
         recovery_authorized=False,
+        expected_quantity=1,
     )
 
     assert decision.allowed is False
@@ -1955,3 +2133,317 @@ def test_recovery_reconciles_fresh_broker_state_after_fill() -> None:
         < refresh_index
         < reconcile_index
     )
+
+def test_eagle_hello_empty_open_snapshot_has_no_relevant_btc() -> None:
+    """Empty Eagle hello snapshot should contain no relevant BTC opens."""
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        ()
+    )
+
+    assert relevant == ()
+
+
+def test_eagle_hello_eth_open_is_ignored_by_btc_only_runner() -> None:
+    """Valid ETH open signal must not block the BTC-only BTS runner."""
+
+    open_positions = (
+        {
+            "signal_id": "eth-signal-001",
+            "symbol": "ETHUSDT",
+            "direction": "long",
+        },
+    )
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        open_positions
+    )
+
+    assert relevant == ()
+
+
+def test_eagle_hello_btc_open_is_relevant() -> None:
+    """BTCUSDT open signal must remain visible to startup safety."""
+
+    btc_position = {
+        "signal_id": "btc-signal-001",
+        "symbol": "BTCUSDT",
+        "direction": "long",
+    }
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        (btc_position,)
+    )
+
+    assert relevant == (
+        btc_position,
+    )
+
+
+def test_eagle_hello_mixed_snapshot_returns_only_btc() -> None:
+    """Mixed Eagle snapshot must filter out unsupported instruments."""
+
+    eth_position = {
+        "signal_id": "eth-signal-001",
+        "symbol": "ETHUSDT",
+        "direction": "long",
+    }
+
+    btc_position = {
+        "signal_id": "btc-signal-001",
+        "symbol": "BTCUSDT",
+        "direction": "short",
+    }
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        (
+            eth_position,
+            btc_position,
+        )
+    )
+
+    assert relevant == (
+        btc_position,
+    )
+
+
+def test_eagle_hello_symbol_matching_is_normalized() -> None:
+    """Startup filtering should use the same normalized symbol convention."""
+
+    btc_position = {
+        "signal_id": "btc-signal-001",
+        "symbol": "  btcusdt  ",
+        "direction": "long",
+    }
+
+    relevant = get_relevant_btc_eagle_open_positions(
+        (btc_position,)
+    )
+
+    assert relevant == (
+        btc_position,
+    )
+
+
+def test_eagle_hello_missing_symbol_fails_closed() -> None:
+    """Ambiguous Eagle open position must never be silently ignored."""
+
+    open_positions = (
+        {
+            "signal_id": "unknown-signal-001",
+            "direction": "long",
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="symbol",
+    ):
+        get_relevant_btc_eagle_open_positions(
+            open_positions
+        )
+
+
+def test_eagle_hello_blank_symbol_fails_closed() -> None:
+    """Blank Eagle symbol must fail closed during startup filtering."""
+
+    open_positions = (
+        {
+            "signal_id": "unknown-signal-001",
+            "symbol": "   ",
+            "direction": "long",
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="symbol",
+    ):
+        get_relevant_btc_eagle_open_positions(
+            open_positions
+        )
+
+
+def test_eagle_hello_non_string_symbol_fails_closed() -> None:
+    """Non-string Eagle symbol must fail closed."""
+
+    open_positions = (
+        {
+            "signal_id": "unknown-signal-001",
+            "symbol": 123,
+            "direction": "long",
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="symbol",
+    ):
+        get_relevant_btc_eagle_open_positions(
+            open_positions
+        )
+
+
+def test_runner_does_not_gate_startup_on_raw_eagle_open_count() -> None:
+    """Startup safety must evaluate relevant BTC opens, not global count."""
+
+    source = script_source()
+
+    assert (
+        "if message.open_count != 0:"
+        not in source
+    )
+
+
+def test_runner_filters_eagle_hello_open_positions_for_btc() -> None:
+    """Runner must explicitly filter Eagle hello opens for BTCUSDT."""
+
+    source = script_source()
+
+    assert (
+        "get_relevant_btc_eagle_open_positions("
+        in source
+    )
+
+    assert (
+        "message.open_positions"
+        in source
+    )
+
+
+def test_runner_rejects_relevant_btc_eagle_open_at_startup() -> None:
+    """A relevant BTC Eagle open must prevent normal trader arming."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "get_relevant_btc_eagle_open_positions("
+    )
+
+    relevant_guard_index = source.index(
+        "if relevant_eagle_open_positions:",
+        helper_index,
+    )
+
+    runtime_error_index = source.index(
+        "raise RuntimeError(",
+        relevant_guard_index,
+    )
+
+    assert (
+        helper_index
+        < relevant_guard_index
+        < runtime_error_index
+    )
+
+def test_contract_month_argument_is_required() -> None:
+    """Operator must explicitly identify the approved MBT expiry."""
+
+    source = script_source()
+    parser_index = source.index("def parse_arguments(")
+    argument_index = source.index('"--contract-month"', parser_index)
+    required_index = source.index("required=True", argument_index)
+
+    assert parser_index < argument_index < required_index
+
+
+def test_local_symbol_argument_is_required() -> None:
+    """Operator must explicitly identify the expected TWS local symbol."""
+
+    source = script_source()
+    parser_index = source.index("def parse_arguments(")
+    argument_index = source.index('"--local-symbol"', parser_index)
+    required_index = source.index("required=True", argument_index)
+
+    assert parser_index < argument_index < required_index
+
+
+def test_quantity_argument_is_required() -> None:
+    """Operator must explicitly choose MBT order quantity."""
+
+    source = script_source()
+    parser_index = source.index("def parse_arguments(")
+    argument_index = source.index('"--quantity"', parser_index)
+    required_index = source.index("required=True", argument_index)
+
+    assert parser_index < argument_index < required_index
+
+
+def test_main_builds_one_validated_execution_config() -> None:
+    """CLI contract and quantity choices must cross one validation boundary."""
+
+    source = script_source()
+    main_index = source.index("def main(")
+    config_index = source.index(
+        "validate_runtime_execution_config(",
+        main_index,
+    )
+    run_index = source.index(
+        "run_continuous_paper_trader(",
+        config_index,
+    )
+
+    assert main_index < config_index < run_index
+
+
+def test_runner_receives_runtime_execution_config() -> None:
+    """Validated configuration must be passed into continuous execution."""
+
+    source = script_source()
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    parameter_index = source.index(
+        "execution_config:",
+        runner_index,
+    )
+
+    assert parameter_index > runner_index
+
+
+def test_preflight_prints_operator_execution_configuration() -> None:
+    """Operator must see exact contract and size before trading."""
+
+    source = script_source()
+
+    assert "APPROVED MBT EXECUTION CONFIGURATION" in source
+    assert "Contract month:" in source
+    assert "Expected local symbol:" in source
+    assert "Order quantity:" in source
+    assert "Hard quantity ceiling:" in source
+
+
+def test_get_mbt_position_uses_runtime_local_symbol() -> None:
+    """Position reconciliation may not depend on MBTQ6 global constant."""
+
+    source = script_source()
+    function_index = source.index("def get_mbt_position(")
+    next_function_index = source.index(
+        "\ndef ",
+        function_index + 1,
+    )
+    function_source = source[
+        function_index:next_function_index
+    ]
+
+    assert "expected_local_symbol" in function_source
+    assert "EXPECTED_LOCAL_SYMBOL" not in function_source
+
+
+def test_reserved_exit_recovery_uses_runtime_quantity() -> None:
+    """Recovery authorization must match the currently approved size."""
+
+    source = script_source()
+    function_index = source.index(
+        "def evaluate_reserved_exit_recovery("
+    )
+    next_function_index = source.index(
+        "\ndef ",
+        function_index + 1,
+    )
+    function_source = source[
+        function_index:next_function_index
+    ]
+
+    assert "expected_quantity" in function_source
+    assert "PAPER_QUANTITY" not in function_source
