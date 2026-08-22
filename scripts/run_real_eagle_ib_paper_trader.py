@@ -88,6 +88,7 @@ CONNECTION_TIMEOUT_SECONDS = 10.0
 EXECUTION_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_MESSAGES = 0
 ARMING_ARGUMENT = "--confirm-continuous-paper"
+RECOVERY_ARGUMENT = "--recover-reserved-exit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +98,27 @@ class DurableOpenSignal:
     signal_id: str
     state: SignalLifecycleState
     last_event_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReservedExitRecord:
+    """Normalized durable RESERVED exit used by recovery checks."""
+
+    event_id: str
+    signal_id: str
+    symbol: str
+    intent: TradeIntent
+    quantity: int
+    status: ExecutionStatus
+    broker_order_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReservedExitRecoveryDecision:
+    """Decision describing whether one RESERVED exit may be recovered."""
+
+    allowed: bool
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +323,257 @@ def require_execution_state_clear(execution_ledger: ExecutionLedger) -> None:
         )
 
 
+def find_reserved_exit(
+    execution_ledger: ExecutionLedger,
+) -> ReservedExitRecord | None:
+    """Return the one recoverable RESERVED closing execution, if present.
+
+    Recovery is intentionally limited to closing orders. A RESERVED
+    opening order is never automatically recoverable because BTS cannot
+    know whether the operator still wants to establish that exposure
+    after a broker outage.
+
+    More than one RESERVED closing execution is treated as an unsafe
+    ambiguous state and fails closed.
+    """
+
+    if not isinstance(
+        execution_ledger,
+        ExecutionLedger,
+    ):
+        raise TypeError(
+            "'execution_ledger' must be an ExecutionLedger."
+        )
+
+    reserved_records = tuple(
+        record
+        for record in execution_ledger.all_records()
+        if record.status is ExecutionStatus.RESERVED
+    )
+
+    if not reserved_records:
+        return None
+
+    reserved_openings = tuple(
+        record
+        for record in reserved_records
+        if TradeIntent(record.intent)
+        in {
+            TradeIntent.BUY_TO_OPEN,
+            TradeIntent.SELL_TO_OPEN,
+        }
+    )
+
+    if reserved_openings:
+        event_ids = ", ".join(
+            record.event_id
+            for record in reserved_openings
+        )
+
+        raise RuntimeError(
+            "RESERVED opening execution cannot be recovered "
+            "automatically. "
+            f"Events: {event_ids}."
+        )
+
+    reserved_exits = tuple(
+        record
+        for record in reserved_records
+        if TradeIntent(record.intent)
+        in {
+            TradeIntent.SELL_TO_CLOSE,
+            TradeIntent.BUY_TO_CLOSE,
+        }
+    )
+
+    if len(reserved_exits) > 1:
+        event_ids = ", ".join(
+            record.event_id
+            for record in reserved_exits
+        )
+
+        raise RuntimeError(
+            "More than one RESERVED exit exists; "
+            "recovery is ambiguous and blocked. "
+            f"Events: {event_ids}."
+        )
+
+    if len(reserved_exits) == 1:
+        record = reserved_exits[0]
+
+        return ReservedExitRecord(
+            event_id=record.event_id,
+            signal_id=record.signal_id,
+            symbol=record.symbol,
+            intent=TradeIntent(record.intent),
+            quantity=record.quantity,
+            status=record.status,
+            broker_order_id=record.broker_order_id,
+        )
+
+    return None
+
+
+def evaluate_reserved_exit_recovery(
+    *,
+    trade_request,
+    broker_position: int,
+    open_signals: tuple[DurableOpenSignal, ...],
+    recovery_authorized: bool,
+) -> ReservedExitRecoveryDecision:
+    """Determine whether a RESERVED exit is safe to recover.
+
+    Recovery requires all of the following:
+
+    - explicit operator authorization;
+    - exactly one durable open BTS signal;
+    - exact signal-ID match;
+    - closing intent only;
+    - broker exposure on the expected side;
+    - lifecycle direction matching the closing intent.
+
+    This function makes no broker call and mutates no durable state.
+    """
+
+    if not isinstance(
+        recovery_authorized,
+        bool,
+    ):
+        raise TypeError(
+            "'recovery_authorized' must be a bool."
+        )
+
+    if not recovery_authorized:
+        return ReservedExitRecoveryDecision(
+            allowed=False,
+            reason=(
+                "Reserved exit recovery requires explicit "
+                "operator authorization."
+            ),
+        )
+
+    if trade_request.symbol != SYMBOL:
+        return ReservedExitRecoveryDecision(
+            allowed=False,
+            reason=(
+                "Reserved exit recovery permits MBT only."
+            ),
+        )
+
+    if trade_request.quantity != PAPER_QUANTITY:
+        return ReservedExitRecoveryDecision(
+            allowed=False,
+            reason=(
+                "Reserved exit recovery permits exactly 1 MBT."
+            ),
+        )
+
+    intent = trade_request.intent
+
+    if intent not in {
+        TradeIntent.SELL_TO_CLOSE,
+        TradeIntent.BUY_TO_CLOSE,
+    }:
+        return ReservedExitRecoveryDecision(
+            allowed=False,
+            reason=(
+                "Reserved exit recovery cannot recover "
+                "an opening order."
+            ),
+        )
+
+    if broker_position == 0:
+        return ReservedExitRecoveryDecision(
+            allowed=False,
+            reason=(
+                "Broker is already flat; no recovery "
+                "closing order may be submitted."
+            ),
+        )
+
+    if broker_position not in {-1, 1}:
+        return ReservedExitRecoveryDecision(
+            allowed=False,
+            reason=(
+                "Broker position is outside the permitted "
+                "-1/+1 MBT recovery state."
+            ),
+        )
+
+    if len(open_signals) != 1:
+        return ReservedExitRecoveryDecision(
+            allowed=False,
+            reason=(
+                "Reserved exit recovery requires exactly "
+                "one durable open signal."
+            ),
+        )
+
+    open_signal = open_signals[0]
+
+    if open_signal.signal_id != trade_request.signal_id:
+        return ReservedExitRecoveryDecision(
+            allowed=False,
+            reason=(
+                "Reserved exit signal ID does not match "
+                "the durable open signal."
+            ),
+        )
+
+    if intent is TradeIntent.SELL_TO_CLOSE:
+        if broker_position != 1:
+            return ReservedExitRecoveryDecision(
+                allowed=False,
+                reason=(
+                    "SELL_TO_CLOSE recovery requires broker "
+                    "position +1 MBT."
+                ),
+            )
+
+        if (
+            open_signal.state
+            is not SignalLifecycleState.LONG_OPEN
+        ):
+            return ReservedExitRecoveryDecision(
+                allowed=False,
+                reason=(
+                    "SELL_TO_CLOSE recovery requires durable "
+                    "LONG_OPEN lifecycle."
+                ),
+            )
+
+    elif intent is TradeIntent.BUY_TO_CLOSE:
+        if broker_position != -1:
+            return ReservedExitRecoveryDecision(
+                allowed=False,
+                reason=(
+                    "BUY_TO_CLOSE recovery requires broker "
+                    "position -1 MBT."
+                ),
+            )
+
+        if (
+            open_signal.state
+            is not SignalLifecycleState.SHORT_OPEN
+        ):
+            return ReservedExitRecoveryDecision(
+                allowed=False,
+                reason=(
+                    "BUY_TO_CLOSE recovery requires durable "
+                    "SHORT_OPEN lifecycle."
+                ),
+            )
+
+    return ReservedExitRecoveryDecision(
+        allowed=True,
+        reason=(
+            "Reserved exit matches broker position, "
+            "durable lifecycle, signal ID, and explicit "
+            "operator recovery authorization."
+        ),
+    )
+
+
 def reconcile_broker_and_lifecycle(
     *,
     broker_client: IBBrokerClient,
@@ -466,11 +739,15 @@ async def run_continuous_paper_trader(
     lifecycle_database_path: str | Path,
     execution_ledger_path: str | Path,
     max_messages: int,
+    recover_reserved_exit: bool = False,
 ) -> ContinuousPaperResult:
     """Run the continuous Eagle LIVE -> TWS paper trader."""
 
     if not isinstance(armed, bool):
         raise TypeError("'armed' must be a bool.")
+
+    if not isinstance(recover_reserved_exit, bool):
+        raise TypeError("'recover_reserved_exit' must be a bool.")
 
     if (
         not isinstance(max_messages, int)
@@ -486,7 +763,15 @@ async def run_continuous_paper_trader(
     adapter = EagleTradeAdapter(lifecycle_guard)
     execution_ledger = ExecutionLedger(execution_ledger_path)
 
-    require_execution_state_clear(execution_ledger)
+    reserved_exit = find_reserved_exit(execution_ledger)
+
+    if reserved_exit is None:
+        require_execution_state_clear(execution_ledger)
+    elif not recover_reserved_exit:
+        raise RuntimeError(
+            "Continuous paper trading blocked by RESERVED exit. "
+            f"Restart with {RECOVERY_ARGUMENT} only after operator review."
+        )
 
     kill_switch = KillSwitch()
     trading_controls = TradingControls(
@@ -579,6 +864,147 @@ async def run_continuous_paper_trader(
             manager=manager,
             broker_client=broker_client,
         )
+
+        # -------------------------------------------------------------
+        # RESERVED-EXIT RECOVERY BOUNDARY
+        # -------------------------------------------------------------
+        if recover_reserved_exit:
+            if not armed:
+                raise RuntimeError(
+                    "Reserved exit recovery requires continuous paper "
+                    "execution to be explicitly armed."
+                )
+
+            reserved_exit = find_reserved_exit(execution_ledger)
+
+            if reserved_exit is None:
+                raise RuntimeError(
+                    "Reserved exit recovery was requested, but no "
+                    "RESERVED closing execution exists."
+                )
+
+            recovery_trade_request = execution_ledger.get_trade_request(
+                reserved_exit.event_id
+            )
+
+            if recovery_trade_request is None:
+                raise RuntimeError(
+                    "RESERVED exit has no recoverable TradeRequest."
+                )
+
+            recovery_position = get_mbt_position(broker_client)
+            recovery_open_signals = load_durable_open_signals(
+                lifecycle_database_path
+            )
+
+            recovery_decision = evaluate_reserved_exit_recovery(
+                trade_request=recovery_trade_request,
+                broker_position=recovery_position,
+                open_signals=recovery_open_signals,
+                recovery_authorized=recover_reserved_exit,
+            )
+
+            print()
+            print("RESERVED EXIT RECOVERY CHECK")
+            print("=" * 72)
+            print(f"Event ID:       {reserved_exit.event_id}")
+            print(f"Signal ID:      {reserved_exit.signal_id}")
+            print(f"Broker position:{recovery_position:>8}")
+            print(f"Recovery allowed: {recovery_decision.allowed}")
+            print(f"Reason: {recovery_decision.reason}")
+            print("=" * 72)
+
+            if not recovery_decision.allowed:
+                raise RuntimeError(
+                    "RESERVED exit recovery rejected: "
+                    f"{recovery_decision.reason}"
+                )
+
+            readiness = IBTradingReadiness(
+                api_ready=app.api_ready,
+                order_id_allocator=app.order_id_allocator,
+                broker_client=broker_client,
+                trading_controls=trading_controls,
+                kill_switch=kill_switch,
+            )
+
+            readiness_result = readiness.require_ready(
+                positions_reconciled=True,
+                execution_state_clear=True,
+            )
+
+            print(f"IB recovery readiness passed: {readiness_result.ready}")
+
+            broker_order_id = app.order_id_allocator.allocate()
+
+            recovery_submission = execution_client.submit_reserved(
+                recovery_trade_request,
+                contract_month=CONTRACT_MONTH,
+                broker_order_id=broker_order_id,
+            )
+            broker_submissions += 1
+
+            expected_action = expected_ib_action(recovery_trade_request)
+            if recovery_submission.package.order.action != expected_action:
+                raise RuntimeError(
+                    "Recovered IB order action does not match TradeRequest."
+                )
+
+            if recovery_submission.package.order.totalQuantity != 1:
+                raise RuntimeError(
+                    "Recovered IB order quantity is not exactly 1."
+                )
+
+            recovery_final_record = wait_for_execution_resolution(
+                execution_ledger=execution_ledger,
+                event_id=recovery_trade_request.event_id,
+                kill_switch=kill_switch,
+                timeout_seconds=EXECUTION_TIMEOUT_SECONDS,
+            )
+
+            if recovery_final_record.status is not ExecutionStatus.FILLED:
+                raise RuntimeError(
+                    "Recovered exit did not reach FILLED. "
+                    f"Status: {recovery_final_record.status.value}. "
+                    f"Reason: {recovery_final_record.reason}"
+                )
+
+            filled_orders += 1
+
+            recovery_lifecycle_decision = coordinator.commit_request(
+                recovery_trade_request
+            )
+
+            if not recovery_lifecycle_decision.approved:
+                raise RuntimeError(
+                    "Recovered broker close FILLED but durable lifecycle "
+                    "commit was rejected."
+                )
+
+            approved_decisions += 1
+
+            refresh_position_snapshot(
+                app=app,
+                manager=manager,
+                broker_client=broker_client,
+            )
+
+            recovered_position, recovered_open_signals = (
+                reconcile_broker_and_lifecycle(
+                    broker_client=broker_client,
+                    lifecycle_database_path=lifecycle_database_path,
+                )
+            )
+
+            if recovered_position != 0 or recovered_open_signals:
+                raise RuntimeError(
+                    "Recovered exit fill did not reconcile BTS and broker flat."
+                )
+
+            print()
+            print("RESERVED EXIT RECOVERED, FILLED, AND RECONCILED.")
+            print("Current MBT position: 0")
+            print("Durable open signals: 0")
 
         starting_position, starting_open_signals = reconcile_broker_and_lifecycle(
             broker_client=broker_client,
@@ -869,6 +1295,251 @@ async def run_continuous_paper_trader(
                         f"{normalized_event.payload['intent']}"
                     )
 
+                    intended_intent = TradeIntent(
+                        normalized_event.payload["intent"]
+                    )
+
+                    is_closing_intent = intended_intent in {
+                        TradeIntent.SELL_TO_CLOSE,
+                        TradeIntent.BUY_TO_CLOSE,
+                    }
+
+                    # ---------------------------------------------------------
+                    # EXIT-OBLIGATION DURABILITY BOUNDARY
+                    # ---------------------------------------------------------
+                    if armed and is_closing_intent:
+                        require_execution_state_clear(
+                            execution_ledger
+                        )
+
+                        event_result = event_processor.process(
+                            message
+                        )
+                        print(f"Event status: {event_result.status.value}")
+
+                        if event_result.status is not EventProcessStatus.ACCEPTED:
+                            print(
+                                "Duplicate/out-of-sequence live exit stopped "
+                                "before execution reservation."
+                            )
+                            continue
+
+                        prepared_decision = coordinator.prepare_event(
+                            normalized_event
+                        )
+
+                        print(
+                            "Trade preparation approved: "
+                            f"{prepared_decision.approved}"
+                        )
+                        print(
+                            "Trade preparation reason:   "
+                            f"{prepared_decision.reason}"
+                        )
+
+                        if not prepared_decision.approved:
+                            rejected_decisions += 1
+                            print(
+                                "Trade preparation rejected; "
+                                "durable lifecycle was NOT mutated."
+                            )
+                            continue
+
+                        trade_request = prepared_decision.trade_request
+
+                        if trade_request is None:
+                            raise RuntimeError(
+                                "Approved prepared decision had no TradeRequest."
+                            )
+
+                        execution_client.reserve_execution(
+                            trade_request
+                        )
+
+                        print(
+                            "Exit execution obligation durably RESERVED "
+                            "before broker refresh."
+                        )
+                        print("Broker order has NOT been submitted.")
+
+                        refresh_position_snapshot(
+                            app=app,
+                            manager=manager,
+                            broker_client=broker_client,
+                        )
+
+                        broker_position, open_signals = (
+                            reconcile_broker_and_lifecycle(
+                                broker_client=broker_client,
+                                lifecycle_database_path=lifecycle_database_path,
+                            )
+                        )
+
+                        validate_trade_request_against_position(
+                            trade_request=trade_request,
+                            broker_position=broker_position,
+                            open_signals=open_signals,
+                        )
+
+                        risk_decision = risk_manager.evaluate(
+                            trade_request,
+                            current_position=broker_position,
+                        )
+
+                        print(f"Risk approved: {risk_decision.approved}")
+                        print(
+                            "Projected position: "
+                            f"{risk_decision.projected_position}"
+                        )
+
+                        if not risk_decision.approved:
+                            rejected_decisions += 1
+                            raise RuntimeError(
+                                "RiskManager rejected RESERVED live Eagle close "
+                                "TradeRequest BEFORE durable lifecycle mutation: "
+                                f"{risk_decision.reason}"
+                            )
+
+                        expected_position = expected_position_after_trade(
+                            trade_request
+                        )
+
+                        if risk_decision.projected_position != expected_position:
+                            raise RuntimeError(
+                                "Risk projected position does not match "
+                                "expected trade result."
+                            )
+
+                        readiness = IBTradingReadiness(
+                            api_ready=app.api_ready,
+                            order_id_allocator=app.order_id_allocator,
+                            broker_client=broker_client,
+                            trading_controls=trading_controls,
+                            kill_switch=kill_switch,
+                        )
+
+                        readiness_result = readiness.require_ready(
+                            positions_reconciled=True,
+                            execution_state_clear=True,
+                        )
+
+                        print(f"IB readiness passed: {readiness_result.ready}")
+
+                        broker_order_id = app.order_id_allocator.allocate()
+
+                        print()
+                        print("=" * 72)
+                        print("LIVE PAPER ORDER AUTHORIZED")
+                        print("=" * 72)
+                        print(f"Eagle event: {trade_request.event_id}")
+                        print(f"Signal ID:   {trade_request.signal_id}")
+                        print(f"Intent:      {trade_request.intent.value}")
+                        print("Quantity:    1 MBT")
+                        print(f"IB order ID: {broker_order_id}")
+                        print("=" * 72)
+
+                        submission = execution_client.submit_reserved(
+                            trade_request,
+                            contract_month=CONTRACT_MONTH,
+                            broker_order_id=broker_order_id,
+                        )
+                        broker_submissions += 1
+
+                        expected_action = expected_ib_action(trade_request)
+                        if submission.package.order.action != expected_action:
+                            raise RuntimeError(
+                                "IB order action does not match TradeRequest."
+                            )
+
+                        if submission.package.order.totalQuantity != 1:
+                            raise RuntimeError(
+                                "IB order quantity is not exactly 1."
+                            )
+
+                        final_record = wait_for_execution_resolution(
+                            execution_ledger=execution_ledger,
+                            event_id=trade_request.event_id,
+                            kill_switch=kill_switch,
+                            timeout_seconds=EXECUTION_TIMEOUT_SECONDS,
+                        )
+
+                        if final_record.status is not ExecutionStatus.FILLED:
+                            raise RuntimeError(
+                                "Paper order did not reach FILLED. "
+                                f"Status: {final_record.status.value}. "
+                                f"Reason: {final_record.reason}"
+                            )
+
+                        filled_orders += 1
+
+                        # Broker has confirmed the close FILLED.
+                        # Only now may BTS commit the durable lifecycle close.
+                        decision = coordinator.commit_request(
+                            trade_request
+                        )
+
+                        print(f"Trade decision approved: {decision.approved}")
+                        print(f"Trade decision reason:   {decision.reason}")
+
+                        if not decision.approved:
+                            raise RuntimeError(
+                                "Broker close FILLED but durable lifecycle "
+                                "commit was rejected."
+                            )
+
+                        approved_decisions += 1
+
+                        committed_trade_request = decision.trade_request
+
+                        if committed_trade_request is None:
+                            raise RuntimeError(
+                                "Approved lifecycle commit had no TradeRequest."
+                            )
+
+                        if committed_trade_request != trade_request:
+                            raise RuntimeError(
+                                "Committed TradeRequest does not match "
+                                "the filled TradeRequest."
+                            )
+
+                        post_decision_open_signals = load_durable_open_signals(
+                            lifecycle_database_path
+                        )
+
+                        if post_decision_open_signals:
+                            raise RuntimeError(
+                                "Filled close did not leave durable lifecycle flat."
+                            )
+
+                        refresh_position_snapshot(
+                            app=app,
+                            manager=manager,
+                            broker_client=broker_client,
+                        )
+
+                        reconciled_position, reconciled_open_signals = (
+                            reconcile_broker_and_lifecycle(
+                                broker_client=broker_client,
+                                lifecycle_database_path=lifecycle_database_path,
+                            )
+                        )
+
+                        if reconciled_position != expected_position:
+                            raise RuntimeError(
+                                "Post-fill broker position does not match "
+                                "expected position."
+                            )
+
+                        print()
+                        print("PAPER ORDER FILLED AND RECONCILED.")
+                        print(f"Current MBT position: {reconciled_position}")
+                        print(
+                            "Durable open signals: "
+                            f"{len(reconciled_open_signals)}"
+                        )
+
+                        continue
+
                     refresh_position_snapshot(
                         app=app,
                         manager=manager,
@@ -881,10 +1552,6 @@ async def run_continuous_paper_trader(
                     )
 
                     require_execution_state_clear(execution_ledger)
-
-                    intended_intent = TradeIntent(
-                        normalized_event.payload["intent"]
-                    )
 
                     if intended_intent in {
                         TradeIntent.BUY_TO_OPEN,
@@ -1279,6 +1946,15 @@ def parse_arguments() -> argparse.Namespace:
         help="Explicitly authorize continuous 1-MBT TWS paper execution.",
     )
     parser.add_argument(
+        RECOVERY_ARGUMENT,
+        action="store_true",
+        dest="recover_reserved_exit",
+        help=(
+            "Explicitly authorize recovery of one durable RESERVED "
+            "MBT closing execution after operator review."
+        ),
+    )
+    parser.add_argument(
         "--max-messages",
         type=int,
         default=DEFAULT_MAX_MESSAGES,
@@ -1306,6 +1982,7 @@ def main() -> int:
         return 1
 
     armed = bool(arguments.confirm_continuous_paper)
+    recover_reserved_exit = bool(arguments.recover_reserved_exit)
 
     print()
     print("Starting continuous Eagle -> IB PAPER trader...")
@@ -1325,6 +2002,7 @@ def main() -> int:
                 lifecycle_database_path=arguments.lifecycle_database,
                 execution_ledger_path=arguments.execution_ledger,
                 max_messages=arguments.max_messages,
+                recover_reserved_exit=recover_reserved_exit,
             )
         )
     except KeyboardInterrupt:

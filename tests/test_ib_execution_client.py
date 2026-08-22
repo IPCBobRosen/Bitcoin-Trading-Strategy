@@ -936,3 +936,114 @@ def test_non_callable_place_order_function_is_rejected(
             ),
             place_order_function=123,  # type: ignore[arg-type]
         )
+
+def test_reserve_execution_creates_reserved_record_without_broker_call(
+    tmp_path,
+) -> None:
+    """A pending execution may be durably reserved without reaching IB."""
+
+    client, duplicate_guard, ledger, place_order = create_client(
+        tmp_path
+    )
+
+    trade_request = create_trade_request(
+        event_id="pending-exit-001",
+        signal_id="signal-a",
+        intent_value="SELL_TO_CLOSE",
+    )
+
+    record = client.reserve_execution(
+        trade_request
+    )
+
+    assert record.event_id == "pending-exit-001"
+    assert record.signal_id == "signal-a"
+    assert record.status is ExecutionStatus.RESERVED
+    assert record.broker_order_id is None
+
+    assert ledger.contains(
+        "pending-exit-001"
+    )
+
+    assert duplicate_guard.contains(
+        "pending-exit-001"
+    )
+
+    place_order.assert_not_called()
+
+
+def test_submit_reserved_execution_uses_exact_existing_reservation(
+    tmp_path,
+) -> None:
+    """A known RESERVED execution may later be submitted exactly once."""
+
+    client, _, ledger, place_order = create_client(
+        tmp_path
+    )
+
+    trade_request = create_trade_request(
+        event_id="pending-exit-002",
+        signal_id="signal-a",
+        intent_value="SELL_TO_CLOSE",
+    )
+
+    client.reserve_execution(
+        trade_request
+    )
+
+    result = client.submit_reserved(
+        trade_request,
+        contract_month="202608",
+        broker_order_id=200,
+    )
+
+    assert result.event_id == "pending-exit-002"
+    assert result.broker_order_id == 200
+
+    record = ledger.get(
+        "pending-exit-002"
+    )
+
+    assert record is not None
+    assert record.status is ExecutionStatus.SUBMITTED
+    assert record.broker_order_id == 200
+
+    assert place_order.call_count == 1
+
+
+def test_submit_reserved_execution_cannot_submit_twice(
+    tmp_path,
+) -> None:
+    """Once RESERVED becomes SUBMITTED it must never be blindly retried."""
+
+    client, _, _, place_order = create_client(
+        tmp_path
+    )
+
+    trade_request = create_trade_request(
+        event_id="pending-exit-003",
+        signal_id="signal-a",
+        intent_value="SELL_TO_CLOSE",
+    )
+
+    client.reserve_execution(
+        trade_request
+    )
+
+    client.submit_reserved(
+        trade_request,
+        contract_month="202608",
+        broker_order_id=201,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="RESERVED",
+    ):
+        client.submit_reserved(
+            trade_request,
+            contract_month="202608",
+            broker_order_id=202,
+        )
+
+    assert place_order.call_count == 1
