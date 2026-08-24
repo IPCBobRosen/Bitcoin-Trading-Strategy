@@ -1,6 +1,7 @@
 """Process IBKR execution details into durable BTS execution state."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 import sqlite3
@@ -105,6 +106,18 @@ class IBExecutionDetailsTransport:
         A cumulative quantity equal to the requested quantity
         advances the order to FILLED.
         """
+
+        # Capture callback arrival immediately, before validation/processing,
+        # so latency telemetry reflects when BTS first received execDetails.
+        callback_received_at_utc = (
+            datetime.now(timezone.utc).isoformat()
+        )
+
+        ib_execution_time = (
+            self._normalize_optional_execution_time(
+                getattr(execution, "time", None)
+            )
+        )
 
         if not isinstance(
             contract,
@@ -224,6 +237,8 @@ class IBExecutionDetailsTransport:
                 event_id=record.event_id,
                 broker_order_id=broker_order_id,
                 cumulative_quantity=cumulative_quantity,
+                ib_execution_time=ib_execution_time,
+                callback_received_at_utc=callback_received_at_utc,
             )
 
             return IBExecutionDetailsResult(
@@ -269,6 +284,8 @@ class IBExecutionDetailsTransport:
             event_id=record.event_id,
             broker_order_id=broker_order_id,
             cumulative_quantity=cumulative_quantity,
+            ib_execution_time=ib_execution_time,
+            callback_received_at_utc=callback_received_at_utc,
         )
 
         if updated.status is record.status:
@@ -451,11 +468,36 @@ class IBExecutionDetailsTransport:
                     event_id TEXT NOT NULL,
                     broker_order_id INTEGER NOT NULL,
                     cumulative_quantity TEXT NOT NULL,
+                    ib_execution_time TEXT,
+                    callback_received_at_utc TEXT,
                     FOREIGN KEY(event_id)
                         REFERENCES execution_records(event_id)
                 )
                 """
             )
+
+            existing_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(ib_execution_details)"
+                ).fetchall()
+            }
+
+            if "ib_execution_time" not in existing_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE ib_execution_details
+                    ADD COLUMN ib_execution_time TEXT
+                    """
+                )
+
+            if "callback_received_at_utc" not in existing_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE ib_execution_details
+                    ADD COLUMN callback_received_at_utc TEXT
+                    """
+                )
 
             connection.execute(
                 """
@@ -500,6 +542,8 @@ class IBExecutionDetailsTransport:
         event_id: str,
         broker_order_id: int,
         cumulative_quantity: Decimal,
+        ib_execution_time: str | None,
+        callback_received_at_utc: str,
     ) -> None:
         """Durably record one processed IB execution."""
 
@@ -511,9 +555,11 @@ class IBExecutionDetailsTransport:
                         exec_id,
                         event_id,
                         broker_order_id,
-                        cumulative_quantity
+                        cumulative_quantity,
+                        ib_execution_time,
+                        callback_received_at_utc
                     )
-                    VALUES (?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         exec_id,
@@ -522,6 +568,8 @@ class IBExecutionDetailsTransport:
                         str(
                             cumulative_quantity
                         ),
+                        ib_execution_time,
+                        callback_received_at_utc,
                     ),
                 )
 
@@ -529,6 +577,26 @@ class IBExecutionDetailsTransport:
             # A concurrent duplicate callback may have inserted
             # the same execId after our initial existence check.
             return
+
+    @staticmethod
+    def _normalize_optional_execution_time(
+        value: Any,
+    ) -> str | None:
+        """Normalize IB's optional execution timestamp for telemetry.
+
+        Missing or blank values remain NULL so telemetry can never block
+        otherwise-valid broker execution processing.
+        """
+
+        if value is None:
+            return None
+
+        if not isinstance(value, str):
+            return str(value)
+
+        normalized = value.strip()
+
+        return normalized or None
 
     def _connect(
         self,

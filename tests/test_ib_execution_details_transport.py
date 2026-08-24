@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import sqlite3
 
 import pytest
 
@@ -102,6 +103,7 @@ def create_execution(
     side: str = "BOT",
     shares=2,
     cum_qty=2,
+    execution_time: str = "",
 ) -> Execution:
     """Create official IB Execution object."""
 
@@ -112,6 +114,7 @@ def create_execution(
     execution.side = side
     execution.shares = shares
     execution.cumQty = cum_qty
+    execution.time = execution_time
 
     return execution
 
@@ -875,3 +878,388 @@ def test_invalid_ledger_is_rejected() -> None:
         IBExecutionDetailsTransport(
             object()  # type: ignore[arg-type]
         )
+
+def test_execution_details_table_has_latency_columns(
+    tmp_path,
+) -> None:
+    """New execution-details table should contain both timing fields."""
+
+    transport, ledger = create_transport(
+        tmp_path
+    )
+
+    with sqlite3.connect(
+        ledger.database_path
+    ) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(ib_execution_details)"
+            ).fetchall()
+        }
+
+    assert "ib_execution_time" in columns
+    assert "callback_received_at_utc" in columns
+
+
+def test_execution_time_and_callback_arrival_are_persisted(
+    tmp_path,
+) -> None:
+    """execDetails should retain IB execution time and BTS callback arrival."""
+
+    transport, ledger = create_transport(
+        tmp_path
+    )
+
+    transport.handle_execution(
+        contract=create_contract(),
+        execution=create_execution(
+            shares=5,
+            cum_qty=5,
+            execution_time="20260824 07:35:17 US/Eastern",
+        ),
+    )
+
+    with sqlite3.connect(
+        ledger.database_path
+    ) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                ib_execution_time,
+                callback_received_at_utc
+            FROM ib_execution_details
+            WHERE exec_id = ?
+            """,
+            ("exec-001",),
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] == "20260824 07:35:17 US/Eastern"
+
+    callback_time = datetime.fromisoformat(
+        row[1]
+    )
+
+    assert callback_time.tzinfo is not None
+    assert callback_time.utcoffset() == timezone.utc.utcoffset(
+        callback_time
+    )
+
+
+def test_blank_ib_execution_time_is_nonfatal_and_stored_null(
+    tmp_path,
+) -> None:
+    """Missing optional IB execution time must never block valid fills."""
+
+    transport, ledger = create_transport(
+        tmp_path
+    )
+
+    result = transport.handle_execution(
+        contract=create_contract(),
+        execution=create_execution(
+            shares=5,
+            cum_qty=5,
+            execution_time="   ",
+        ),
+    )
+
+    assert (
+        result.execution_record.status
+        is ExecutionStatus.FILLED
+    )
+
+    with sqlite3.connect(
+        ledger.database_path
+    ) as connection:
+        row = connection.execute(
+            """
+            SELECT ib_execution_time
+            FROM ib_execution_details
+            WHERE exec_id = ?
+            """,
+            ("exec-001",),
+        ).fetchone()
+
+    assert row == (None,)
+
+
+def test_duplicate_exec_id_does_not_overwrite_original_timing(
+    tmp_path,
+) -> None:
+    """Duplicate callbacks must preserve the first durable timing evidence."""
+
+    transport, ledger = create_transport(
+        tmp_path
+    )
+
+    first = create_execution(
+        exec_id="exec-001",
+        shares=2,
+        cum_qty=2,
+        execution_time="FIRST-IB-TIME",
+    )
+
+    transport.handle_execution(
+        contract=create_contract(),
+        execution=first,
+    )
+
+    with sqlite3.connect(
+        ledger.database_path
+    ) as connection:
+        before = connection.execute(
+            """
+            SELECT
+                ib_execution_time,
+                callback_received_at_utc
+            FROM ib_execution_details
+            WHERE exec_id = ?
+            """,
+            ("exec-001",),
+        ).fetchone()
+
+    duplicate = create_execution(
+        exec_id="exec-001",
+        shares=2,
+        cum_qty=2,
+        execution_time="SECOND-IB-TIME",
+    )
+
+    result = transport.handle_execution(
+        contract=create_contract(),
+        execution=duplicate,
+    )
+
+    with sqlite3.connect(
+        ledger.database_path
+    ) as connection:
+        after = connection.execute(
+            """
+            SELECT
+                ib_execution_time,
+                callback_received_at_utc
+            FROM ib_execution_details
+            WHERE exec_id = ?
+            """,
+            ("exec-001",),
+        ).fetchone()
+
+    assert (
+        result.outcome
+        is IBExecutionDetailsOutcome.DUPLICATE
+    )
+    assert after == before
+
+
+def test_existing_execution_details_table_migrates_without_losing_rows(
+    tmp_path,
+) -> None:
+    """Old live ledgers should gain timing columns without losing history."""
+
+    database_path = (
+        tmp_path
+        / "legacy_execution_ledger.db"
+    )
+
+    ledger = ExecutionLedger(
+        database_path
+    )
+
+    ledger.reserve(
+        create_trade_request()
+    )
+
+    ledger.mark_submitted(
+        "event-001",
+        broker_order_id=100,
+    )
+
+    with sqlite3.connect(
+        database_path
+    ) as connection:
+        connection.execute(
+            """
+            CREATE TABLE ib_execution_details (
+                exec_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                broker_order_id INTEGER NOT NULL,
+                cumulative_quantity TEXT NOT NULL,
+                FOREIGN KEY(event_id)
+                    REFERENCES execution_records(event_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            INSERT INTO ib_execution_details (
+                exec_id,
+                event_id,
+                broker_order_id,
+                cumulative_quantity
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                "legacy-exec-001",
+                "event-001",
+                100,
+                "1",
+            ),
+        )
+
+    IBExecutionDetailsTransport(
+        ledger
+    )
+
+    with sqlite3.connect(
+        database_path
+    ) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(ib_execution_details)"
+            ).fetchall()
+        }
+
+        row = connection.execute(
+            """
+            SELECT
+                exec_id,
+                event_id,
+                broker_order_id,
+                cumulative_quantity,
+                ib_execution_time,
+                callback_received_at_utc
+            FROM ib_execution_details
+            WHERE exec_id = ?
+            """,
+            ("legacy-exec-001",),
+        ).fetchone()
+
+    assert "ib_execution_time" in columns
+    assert "callback_received_at_utc" in columns
+
+    assert row == (
+        "legacy-exec-001",
+        "event-001",
+        100,
+        "1",
+        None,
+        None,
+    )
+
+
+def test_execution_timing_survives_transport_restart(
+    tmp_path,
+) -> None:
+    """Persisted timing evidence should remain available after BTS restart."""
+
+    database_path = (
+        tmp_path
+        / "restart_timing.db"
+    )
+
+    ledger = ExecutionLedger(
+        database_path
+    )
+
+    ledger.reserve(
+        create_trade_request()
+    )
+
+    ledger.mark_submitted(
+        "event-001",
+        broker_order_id=100,
+    )
+
+    first = IBExecutionDetailsTransport(
+        ledger
+    )
+
+    first.handle_execution(
+        contract=create_contract(),
+        execution=create_execution(
+            shares=5,
+            cum_qty=5,
+            execution_time="20260824 08:35:45 US/Eastern",
+        ),
+    )
+
+    restarted = IBExecutionDetailsTransport(
+        ExecutionLedger(
+            database_path
+        )
+    )
+
+    assert restarted.contains_execution(
+        "exec-001"
+    )
+
+    with sqlite3.connect(
+        database_path
+    ) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                ib_execution_time,
+                callback_received_at_utc
+            FROM ib_execution_details
+            WHERE exec_id = ?
+            """,
+            ("exec-001",),
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] == "20260824 08:35:45 US/Eastern"
+    assert row[1] is not None
+
+
+def test_partial_fills_retain_individual_execution_times(
+    tmp_path,
+) -> None:
+    """Each distinct execId should retain its own IB execution timestamp."""
+
+    transport, ledger = create_transport(
+        tmp_path
+    )
+
+    transport.handle_execution(
+        contract=create_contract(),
+        execution=create_execution(
+            exec_id="exec-001",
+            shares=2,
+            cum_qty=2,
+            execution_time="TIME-ONE",
+        ),
+    )
+
+    transport.handle_execution(
+        contract=create_contract(),
+        execution=create_execution(
+            exec_id="exec-002",
+            shares=3,
+            cum_qty=5,
+            execution_time="TIME-TWO",
+        ),
+    )
+
+    with sqlite3.connect(
+        ledger.database_path
+    ) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                exec_id,
+                ib_execution_time
+            FROM ib_execution_details
+            ORDER BY exec_id
+            """
+        ).fetchall()
+
+    assert rows == [
+        ("exec-001", "TIME-ONE"),
+        ("exec-002", "TIME-TWO"),
+    ]
