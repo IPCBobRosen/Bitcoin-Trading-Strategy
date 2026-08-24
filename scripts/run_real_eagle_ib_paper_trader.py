@@ -312,6 +312,122 @@ def get_relevant_btc_eagle_open_positions(
     return tuple(relevant_positions)
 
 
+def require_eagle_hello_reconciled(
+    *,
+    relevant_eagle_open_positions: tuple[dict[str, object], ...],
+    broker_position: int,
+    open_signals: tuple[DurableOpenSignal, ...],
+    expected_quantity: int,
+) -> None:
+    """Require Eagle hello, BTS lifecycle, and broker exposure to agree.
+
+    A fund.hello frame is a snapshot/control frame, never a trading
+    instruction. Startup may continue with an existing BTC position only when
+    Eagle's one relevant open signal exactly matches the already-reconciled
+    BTS durable signal and broker direction.
+
+    Any ambiguity or disagreement fails closed.
+    """
+
+    if (
+        not isinstance(expected_quantity, int)
+        or isinstance(expected_quantity, bool)
+        or expected_quantity < 1
+        or expected_quantity > MAX_CONFIGURABLE_QUANTITY
+    ):
+        raise ValueError(
+            "'expected_quantity' is outside the approved range."
+        )
+
+    if len(relevant_eagle_open_positions) > 1:
+        raise RuntimeError(
+            "Eagle hello contains more than one relevant BTCUSDT open "
+            "position; startup reconciliation is ambiguous."
+        )
+
+    if broker_position == 0 and not open_signals:
+        if relevant_eagle_open_positions:
+            raise RuntimeError(
+                "Eagle hello contains a relevant BTCUSDT open position "
+                "but BTS and broker are flat."
+            )
+        return
+
+    if broker_position == 0:
+        raise RuntimeError(
+            "Eagle hello startup reconciliation found BTS open lifecycle "
+            "state while broker is flat."
+        )
+
+    if len(open_signals) != 1:
+        raise RuntimeError(
+            "Eagle hello startup reconciliation requires exactly one "
+            "durable BTS open signal when broker is positioned."
+        )
+
+    if broker_position not in {-expected_quantity, expected_quantity}:
+        raise RuntimeError(
+            "Eagle hello startup reconciliation found broker position "
+            "outside the approved runtime quantity."
+        )
+
+    if len(relevant_eagle_open_positions) != 1:
+        raise RuntimeError(
+            "BTS and broker have an open MBT position but Eagle hello "
+            "does not contain exactly one matching BTCUSDT open position."
+        )
+
+    eagle_open = relevant_eagle_open_positions[0]
+
+    raw_signal_id = eagle_open.get("signal_id")
+    if not isinstance(raw_signal_id, str) or not raw_signal_id.strip():
+        raise RuntimeError(
+            "Eagle hello BTCUSDT open position must contain a non-empty "
+            "signal_id."
+        )
+    eagle_signal_id = raw_signal_id.strip()
+
+    raw_direction = eagle_open.get("direction")
+    if not isinstance(raw_direction, str) or not raw_direction.strip():
+        raise RuntimeError(
+            "Eagle hello BTCUSDT open position must contain a non-empty "
+            "direction."
+        )
+
+    eagle_direction = raw_direction.strip().lower()
+    if eagle_direction not in {"long", "short"}:
+        raise RuntimeError(
+            "Eagle hello BTCUSDT open position has unsupported direction "
+            f"{raw_direction!r}."
+        )
+
+    durable_open = open_signals[0]
+
+    if eagle_signal_id != durable_open.signal_id:
+        raise RuntimeError(
+            "Eagle hello BTCUSDT signal_id does not match the durable "
+            "BTS open signal."
+        )
+
+    if broker_position == expected_quantity:
+        expected_direction = "long"
+        expected_state = SignalLifecycleState.LONG_OPEN
+    else:
+        expected_direction = "short"
+        expected_state = SignalLifecycleState.SHORT_OPEN
+
+    if durable_open.state is not expected_state:
+        raise RuntimeError(
+            "Eagle hello startup reconciliation found durable BTS "
+            "direction inconsistent with broker position."
+        )
+
+    if eagle_direction != expected_direction:
+        raise RuntimeError(
+            "Eagle hello BTCUSDT direction does not match the reconciled "
+            "BTS/broker position."
+        )
+
 
 def get_mbt_position(
     broker_client: IBBrokerClient,
@@ -1260,12 +1376,18 @@ async def run_continuous_paper_trader(
                     f"{len(relevant_eagle_open_positions)}"
                 )
 
-                if relevant_eagle_open_positions:
-                    raise RuntimeError(
-                        "Continuous paper trader will not arm when Eagle hello "
-                        "contains a relevant BTCUSDT open position; raw "
-                        "open_count is non-zero."
-                    )
+                require_eagle_hello_reconciled(
+                    relevant_eagle_open_positions=(
+                        relevant_eagle_open_positions
+                    ),
+                    broker_position=starting_position,
+                    open_signals=starting_open_signals,
+                    expected_quantity=execution_config.quantity,
+                )
+
+                print(
+                    "Eagle/BTS/TWS startup reconciliation: PASSED"
+                )
 
             elif isinstance(message, EagleHeartbeat):
                 heartbeats += 1
