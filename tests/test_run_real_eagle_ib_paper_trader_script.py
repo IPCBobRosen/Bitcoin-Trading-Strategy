@@ -50,6 +50,7 @@ from scripts.run_real_eagle_ib_paper_trader import (
     get_mbt_position,
     get_relevant_btc_eagle_open_positions,
     load_durable_open_signals,
+    require_eagle_hello_reconciled,
     reconcile_broker_and_lifecycle,
     require_execution_state_clear,
     require_no_other_broker_positions,
@@ -1233,25 +1234,6 @@ def test_script_blocks_replay_execution() -> None:
     )
 
 
-def test_script_rejects_nonzero_eagle_open_count() -> None:
-    """First continuous runner must not join mid-position."""
-
-    source = script_source()
-
-    assert (
-        "message.open_count"
-        in source
-    )
-
-    assert (
-        "open_count "
-        in source
-    )
-
-    assert (
-        "is non-zero."
-        in source
-    )
 
 
 def test_script_has_observe_only_boundary_before_coordinator() -> None:
@@ -2311,29 +2293,29 @@ def test_runner_filters_eagle_hello_open_positions_for_btc() -> None:
     )
 
 
-def test_runner_rejects_relevant_btc_eagle_open_at_startup() -> None:
-    """A relevant BTC Eagle open must prevent normal trader arming."""
+def test_runner_reconciles_relevant_btc_eagle_open_at_startup() -> None:
+    """Known Eagle open must cross the Eagle/BTS/TWS reconciliation gate."""
 
     source = script_source()
 
-    helper_index = source.index(
+    filter_index = source.index(
         "get_relevant_btc_eagle_open_positions("
     )
 
-    relevant_guard_index = source.index(
-        "if relevant_eagle_open_positions:",
-        helper_index,
+    reconcile_index = source.index(
+        "require_eagle_hello_reconciled(",
+        filter_index,
     )
 
-    runtime_error_index = source.index(
-        "raise RuntimeError(",
-        relevant_guard_index,
+    heartbeat_index = source.index(
+        "elif isinstance(message, EagleHeartbeat):",
+        reconcile_index,
     )
 
     assert (
-        helper_index
-        < relevant_guard_index
-        < runtime_error_index
+        filter_index
+        < reconcile_index
+        < heartbeat_index
     )
 
 def test_contract_month_argument_is_required() -> None:
@@ -2447,3 +2429,259 @@ def test_reserved_exit_recovery_uses_runtime_quantity() -> None:
 
     assert "expected_quantity" in function_source
     assert "PAPER_QUANTITY" not in function_source
+
+
+def test_eagle_hello_reconciliation_accepts_flat_everywhere() -> None:
+    """Flat Eagle + flat BTS + flat broker should allow startup."""
+
+    require_eagle_hello_reconciled(
+        relevant_eagle_open_positions=(),
+        broker_position=0,
+        open_signals=(),
+        expected_quantity=1,
+    )
+
+
+def test_eagle_hello_reconciliation_accepts_matching_short_restart() -> None:
+    """Known Eagle short may resume when Eagle, BTS, and broker all agree."""
+
+    eagle_open = {
+        "signal_id": "signal-short-001",
+        "symbol": "BTCUSDT",
+        "direction": "short",
+    }
+    durable_open = DurableOpenSignal(
+        signal_id="signal-short-001",
+        state=SignalLifecycleState.SHORT_OPEN,
+        last_event_id="signal-short-001:entry",
+    )
+
+    require_eagle_hello_reconciled(
+        relevant_eagle_open_positions=(eagle_open,),
+        broker_position=-1,
+        open_signals=(durable_open,),
+        expected_quantity=1,
+    )
+
+
+def test_eagle_hello_reconciliation_accepts_matching_long_restart() -> None:
+    """Known Eagle long may resume when Eagle, BTS, and broker all agree."""
+
+    eagle_open = {
+        "signal_id": "signal-long-001",
+        "symbol": "BTCUSDT",
+        "direction": "long",
+    }
+    durable_open = DurableOpenSignal(
+        signal_id="signal-long-001",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="signal-long-001:entry",
+    )
+
+    require_eagle_hello_reconciled(
+        relevant_eagle_open_positions=(eagle_open,),
+        broker_position=5,
+        open_signals=(durable_open,),
+        expected_quantity=5,
+    )
+
+
+def test_eagle_hello_reconciliation_rejects_eagle_open_when_flat() -> None:
+    """Unexpected Eagle exposure must still fail closed."""
+
+    eagle_open = {
+        "signal_id": "signal-a",
+        "symbol": "BTCUSDT",
+        "direction": "long",
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="flat",
+    ):
+        require_eagle_hello_reconciled(
+            relevant_eagle_open_positions=(eagle_open,),
+            broker_position=0,
+            open_signals=(),
+            expected_quantity=1,
+        )
+
+
+def test_eagle_hello_reconciliation_rejects_missing_eagle_open() -> None:
+    """Broker/BTS exposure without matching Eagle open must fail closed."""
+
+    durable_open = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.SHORT_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Eagle hello",
+    ):
+        require_eagle_hello_reconciled(
+            relevant_eagle_open_positions=(),
+            broker_position=-1,
+            open_signals=(durable_open,),
+            expected_quantity=1,
+        )
+
+
+def test_eagle_hello_reconciliation_rejects_wrong_signal_id() -> None:
+    """Signal identity, not just market direction, must match exactly."""
+
+    eagle_open = {
+        "signal_id": "signal-b",
+        "symbol": "BTCUSDT",
+        "direction": "short",
+    }
+    durable_open = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.SHORT_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="signal_id",
+    ):
+        require_eagle_hello_reconciled(
+            relevant_eagle_open_positions=(eagle_open,),
+            broker_position=-1,
+            open_signals=(durable_open,),
+            expected_quantity=1,
+        )
+
+
+def test_eagle_hello_reconciliation_rejects_wrong_direction() -> None:
+    """Matching signal ID cannot override an Eagle/broker direction mismatch."""
+
+    eagle_open = {
+        "signal_id": "signal-a",
+        "symbol": "BTCUSDT",
+        "direction": "long",
+    }
+    durable_open = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.SHORT_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="direction",
+    ):
+        require_eagle_hello_reconciled(
+            relevant_eagle_open_positions=(eagle_open,),
+            broker_position=-1,
+            open_signals=(durable_open,),
+            expected_quantity=1,
+        )
+
+
+def test_eagle_hello_reconciliation_rejects_multiple_btc_opens() -> None:
+    """Multiple relevant Eagle positions are ambiguous and must fail closed."""
+
+    opens = (
+        {
+            "signal_id": "signal-a",
+            "symbol": "BTCUSDT",
+            "direction": "long",
+        },
+        {
+            "signal_id": "signal-b",
+            "symbol": "BTCUSDT",
+            "direction": "short",
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="more than one",
+    ):
+        require_eagle_hello_reconciled(
+            relevant_eagle_open_positions=opens,
+            broker_position=1,
+            open_signals=(
+                DurableOpenSignal(
+                    signal_id="signal-a",
+                    state=SignalLifecycleState.LONG_OPEN,
+                    last_event_id="signal-a:entry",
+                ),
+            ),
+            expected_quantity=1,
+        )
+
+
+def test_eagle_hello_reconciliation_rejects_missing_signal_id() -> None:
+    """Ambiguous Eagle position identity must fail closed."""
+
+    eagle_open = {
+        "symbol": "BTCUSDT",
+        "direction": "short",
+    }
+    durable_open = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.SHORT_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="signal_id",
+    ):
+        require_eagle_hello_reconciled(
+            relevant_eagle_open_positions=(eagle_open,),
+            broker_position=-1,
+            open_signals=(durable_open,),
+            expected_quantity=1,
+        )
+
+
+def test_eagle_hello_reconciliation_rejects_invalid_direction() -> None:
+    """Unsupported Eagle direction must fail closed."""
+
+    eagle_open = {
+        "signal_id": "signal-a",
+        "symbol": "BTCUSDT",
+        "direction": "sideways",
+    }
+    durable_open = DurableOpenSignal(
+        signal_id="signal-a",
+        state=SignalLifecycleState.SHORT_OPEN,
+        last_event_id="signal-a:entry",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="unsupported direction",
+    ):
+        require_eagle_hello_reconciled(
+            relevant_eagle_open_positions=(eagle_open,),
+            broker_position=-1,
+            open_signals=(durable_open,),
+            expected_quantity=1,
+        )
+
+
+def test_eagle_hello_startup_reconciliation_does_not_submit_order() -> None:
+    """Hello snapshot reconciliation must remain outside broker submission."""
+
+    source = script_source()
+
+    hello_index = source.index(
+        "if isinstance(message, EagleHello):"
+    )
+    heartbeat_index = source.index(
+        "elif isinstance(message, EagleHeartbeat):",
+        hello_index,
+    )
+    hello_source = source[
+        hello_index:heartbeat_index
+    ]
+
+    assert "require_eagle_hello_reconciled(" in hello_source
+    assert "execution_client.submit(" not in hello_source
+    assert "execution_client.submit_reserved(" not in hello_source
+    assert "placeOrder(" not in hello_source
