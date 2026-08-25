@@ -2161,6 +2161,8 @@ async def run_continuous_paper_trader(
                         reconcile_broker_and_lifecycle(
                             broker_client=broker_client,
                             lifecycle_database_path=lifecycle_database_path,
+                            expected_local_symbol=execution_config.local_symbol,
+                            expected_quantity=execution_config.quantity,
                         )
                     )
 
