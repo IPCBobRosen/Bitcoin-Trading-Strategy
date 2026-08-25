@@ -312,6 +312,54 @@ def get_relevant_btc_eagle_open_positions(
     return tuple(relevant_positions)
 
 
+def get_missed_eagle_signal_ids(
+    *,
+    relevant_eagle_open_positions: tuple[dict[str, object], ...],
+    broker_position: int,
+    open_signals: tuple["DurableOpenSignal", ...],
+) -> frozenset[str]:
+    """Identify Eagle BTC positions that BTS missed while it was offline.
+
+    A position is considered missed only when BTS and the broker are both
+    flat. In that case BTS deliberately does not chase the existing Eagle
+    trade. The returned signal IDs are used to suppress replay lifecycle
+    mutation and to ignore the eventual exit.
+
+    When BTS or the broker already has exposure, this function returns an
+    empty set so the normal strict Eagle/BTS/TWS reconciliation remains in
+    force.
+    """
+
+    if broker_position != 0 or open_signals:
+        return frozenset()
+
+    signal_ids: list[str] = []
+
+    for position in relevant_eagle_open_positions:
+        raw_signal_id = position.get("signal_id")
+
+        if (
+            not isinstance(raw_signal_id, str)
+            or not raw_signal_id.strip()
+        ):
+            raise RuntimeError(
+                "Eagle hello BTCUSDT open position must contain a "
+                "non-empty signal_id before BTS can classify it as missed."
+            )
+
+        signal_ids.append(
+            raw_signal_id.strip()
+        )
+
+    if len(set(signal_ids)) != len(signal_ids):
+        raise RuntimeError(
+            "Eagle hello contains duplicate BTCUSDT signal IDs; "
+            "missed-trade classification is ambiguous."
+        )
+
+    return frozenset(signal_ids)
+
+
 def require_eagle_hello_reconciled(
     *,
     relevant_eagle_open_positions: tuple[dict[str, object], ...],
@@ -1117,6 +1165,12 @@ async def run_continuous_paper_trader(
     messages_observed = 0
     final_mbt_position = 0
 
+    # Signal IDs that Eagle says are currently open even though BTS and
+    # the broker were flat at startup. These trades were missed while BTS
+    # was offline and must never be chased or reconstructed into broker
+    # exposure.
+    missed_eagle_signal_ids: set[str] = set()
+
     try:
         manager.connect()
 
@@ -1376,18 +1430,59 @@ async def run_continuous_paper_trader(
                     f"{len(relevant_eagle_open_positions)}"
                 )
 
-                require_eagle_hello_reconciled(
-                    relevant_eagle_open_positions=(
-                        relevant_eagle_open_positions
-                    ),
-                    broker_position=starting_position,
-                    open_signals=starting_open_signals,
-                    expected_quantity=execution_config.quantity,
+                missed_eagle_signal_ids = set(
+                    get_missed_eagle_signal_ids(
+                        relevant_eagle_open_positions=(
+                            relevant_eagle_open_positions
+                        ),
+                        broker_position=starting_position,
+                        open_signals=starting_open_signals,
+                    )
                 )
 
-                print(
-                    "Eagle/BTS/TWS startup reconciliation: PASSED"
-                )
+                if missed_eagle_signal_ids:
+                    print()
+                    print(
+                        "EAGLE OPEN POSITION MISSED WHILE BTS WAS OFFLINE"
+                    )
+                    print(
+                        "BTS and the broker are flat. Existing Eagle "
+                        "BTC positions will NOT be chased."
+                    )
+
+                    for missed_signal_id in sorted(
+                        missed_eagle_signal_ids
+                    ):
+                        print(
+                            f"Missed Signal ID: {missed_signal_id}"
+                        )
+
+                    print(
+                        "Replay for these signal IDs will be consumed "
+                        "without creating BTS lifecycle exposure."
+                    )
+                    print(
+                        "Their eventual exits will be consumed with "
+                        "NO broker order."
+                    )
+                    print(
+                        "BTS will trade the next fresh BTC fund.entry "
+                        "normally."
+                    )
+
+                else:
+                    require_eagle_hello_reconciled(
+                        relevant_eagle_open_positions=(
+                            relevant_eagle_open_positions
+                        ),
+                        broker_position=starting_position,
+                        open_signals=starting_open_signals,
+                        expected_quantity=execution_config.quantity,
+                    )
+
+                    print(
+                        "Eagle/BTS/TWS startup reconciliation: PASSED"
+                    )
 
             elif isinstance(message, EagleHeartbeat):
                 heartbeats += 1
@@ -1492,6 +1587,11 @@ async def run_continuous_paper_trader(
 
                     if event_result.status is not EventProcessStatus.ACCEPTED:
                         print("Duplicate/out-of-sequence replay event stopped.")
+                    elif message.signal_id in missed_eagle_signal_ids:
+                        print(
+                            "MISSED EAGLE TRADE REPLAY CONSUMED - "
+                            "no BTS lifecycle mutation and no broker order."
+                        )
                     elif message.message_type not in {"fund.entry", "fund.exit"}:
                         print("Lifecycle type ignored.")
                     else:
@@ -1553,6 +1653,49 @@ async def run_continuous_paper_trader(
                             "Live Eagle lifecycle arrived before required "
                             "post-replay heartbeat."
                         )
+
+                    if message.signal_id in missed_eagle_signal_ids:
+                        print(
+                            "MISSED EAGLE TRADE LIFECYCLE IGNORED"
+                        )
+                        print(
+                            f"Signal ID: {message.signal_id}"
+                        )
+                        print(
+                            f"Lifecycle: {message.message_type}"
+                        )
+                        print(
+                            "BTS never entered this Eagle trade; "
+                            "NO broker order will be submitted."
+                        )
+
+                        if armed:
+                            missed_event_result = (
+                                event_processor.process(
+                                    message
+                                )
+                            )
+                            print(
+                                "Event status: "
+                                f"{missed_event_result.status.value}"
+                            )
+                        else:
+                            print(
+                                "OBSERVE MODE - missed lifecycle event "
+                                "was not persisted."
+                            )
+
+                        if message.message_type == "fund.exit":
+                            missed_eagle_signal_ids.discard(
+                                message.signal_id
+                            )
+                            print(
+                                "Missed Eagle trade is now closed; "
+                                "BTS remains flat and ready for the "
+                                "next fresh BTC fund.entry."
+                            )
+
+                        continue
 
                     # Adapter is non-executing. It lets us identify BTC intent
                     # before deciding whether armed durable processing is allowed.

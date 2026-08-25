@@ -49,6 +49,7 @@ from scripts.run_real_eagle_ib_paper_trader import (
     find_reserved_exit,
     get_mbt_position,
     get_relevant_btc_eagle_open_positions,
+    get_missed_eagle_signal_ids,
     load_durable_open_signals,
     require_eagle_hello_reconciled,
     reconcile_broker_and_lifecycle,
@@ -1235,7 +1236,6 @@ def test_script_blocks_replay_execution() -> None:
 
 
 
-
 def test_script_has_observe_only_boundary_before_coordinator() -> None:
     """Unarmed live mode must stop before TradeCoordinator preparation."""
 
@@ -1562,10 +1562,13 @@ def test_already_positioned_opening_signal_is_nonfatal_skip() -> None:
         "is already positioned."
     )
 
-    assert expected_message in source
+    live_index = source.index(
+        "# LIVE lifecycle event."
+    )
 
     positioned_guard_index = source.index(
-        "if broker_position != 0 or open_signals:"
+        "if broker_position != 0 or open_signals:",
+        live_index,
     )
 
     skip_message_index = source.index(
@@ -1595,8 +1598,13 @@ def test_skipped_second_entry_is_durably_consumed_before_continue() -> None:
 
     source = script_source()
 
+    live_index = source.index(
+        "# LIVE lifecycle event."
+    )
+
     positioned_guard_index = source.index(
-        "if broker_position != 0 or open_signals:"
+        "if broker_position != 0 or open_signals:",
+        live_index,
     )
 
     event_process_index = source.index(
@@ -2685,3 +2693,221 @@ def test_eagle_hello_startup_reconciliation_does_not_submit_order() -> None:
     assert "execution_client.submit(" not in hello_source
     assert "execution_client.submit_reserved(" not in hello_source
     assert "placeOrder(" not in hello_source
+
+
+def test_missed_eagle_open_is_classified_when_bts_and_broker_flat() -> None:
+    """An Eagle open with flat BTS/TWS is a missed trade, not a startup error."""
+
+    eagle_open = {
+        "signal_id": "missed-btc-001",
+        "symbol": "BTCUSDT",
+        "direction": "short",
+    }
+
+    missed = get_missed_eagle_signal_ids(
+        relevant_eagle_open_positions=(
+            eagle_open,
+        ),
+        broker_position=0,
+        open_signals=(),
+    )
+
+    assert missed == frozenset(
+        {"missed-btc-001"}
+    )
+
+
+def test_missed_eagle_classifier_does_not_override_real_position_reconciliation() -> None:
+    """Existing BTS/broker exposure must continue through strict reconciliation."""
+
+    eagle_open = {
+        "signal_id": "btc-001",
+        "symbol": "BTCUSDT",
+        "direction": "long",
+    }
+
+    durable_open = DurableOpenSignal(
+        signal_id="btc-001",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="btc-001:entry",
+    )
+
+    missed = get_missed_eagle_signal_ids(
+        relevant_eagle_open_positions=(
+            eagle_open,
+        ),
+        broker_position=1,
+        open_signals=(
+            durable_open,
+        ),
+    )
+
+    assert missed == frozenset()
+
+
+def test_missed_eagle_classifier_requires_signal_id() -> None:
+    """A missed trade still needs a durable identity for safe suppression."""
+
+    eagle_open = {
+        "symbol": "BTCUSDT",
+        "direction": "short",
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="signal_id",
+    ):
+        get_missed_eagle_signal_ids(
+            relevant_eagle_open_positions=(
+                eagle_open,
+            ),
+            broker_position=0,
+            open_signals=(),
+        )
+
+
+def test_missed_eagle_classifier_rejects_duplicate_signal_ids() -> None:
+    """Duplicate Eagle IDs are ambiguous and must fail closed."""
+
+    opens = (
+        {
+            "signal_id": "same-id",
+            "symbol": "BTCUSDT",
+            "direction": "long",
+        },
+        {
+            "signal_id": "same-id",
+            "symbol": "BTCUSDT",
+            "direction": "short",
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="duplicate",
+    ):
+        get_missed_eagle_signal_ids(
+            relevant_eagle_open_positions=opens,
+            broker_position=0,
+            open_signals=(),
+        )
+
+
+def test_runner_classifies_flat_eagle_open_as_missed_before_strict_reconcile() -> None:
+    """Flat BTS/TWS must classify an existing Eagle open instead of failing startup."""
+
+    source = script_source()
+
+    hello_index = source.index(
+        "if isinstance(message, EagleHello):"
+    )
+
+    heartbeat_index = source.index(
+        "elif isinstance(message, EagleHeartbeat):",
+        hello_index,
+    )
+
+    hello_source = source[
+        hello_index:heartbeat_index
+    ]
+
+    classify_index = hello_source.index(
+        "get_missed_eagle_signal_ids("
+    )
+
+    strict_index = hello_source.index(
+        "require_eagle_hello_reconciled(",
+        classify_index,
+    )
+
+    assert classify_index < strict_index
+    assert "Existing Eagle " in hello_source
+    assert "BTC positions will NOT be chased." in hello_source
+
+
+def test_missed_replay_entry_cannot_reach_trade_coordinator() -> None:
+    """Replay entry for a missed signal must not manufacture BTS lifecycle state."""
+
+    source = script_source()
+
+    replay_index = source.index(
+        "# REPLAY lifecycle events"
+    )
+
+    live_index = source.index(
+        "# LIVE lifecycle event.",
+        replay_index,
+    )
+
+    replay_source = source[
+        replay_index:live_index
+    ]
+
+    missed_index = replay_source.index(
+        "message.signal_id in missed_eagle_signal_ids"
+    )
+
+    coordinator_index = replay_source.index(
+        "coordinator.process_event("
+    )
+
+    assert missed_index < coordinator_index
+    assert (
+        "MISSED EAGLE TRADE REPLAY CONSUMED"
+        in replay_source
+    )
+
+
+def test_missed_live_exit_is_consumed_before_adapter_and_submission() -> None:
+    """Exit from a trade BTS never entered must never create a broker close."""
+
+    source = script_source()
+
+    live_index = source.index(
+        "# LIVE lifecycle event."
+    )
+
+    adapter_index = source.index(
+        "adapt_result = adapter.adapt(message)",
+        live_index,
+    )
+
+    missed_index = source.index(
+        "if message.signal_id in missed_eagle_signal_ids:",
+        live_index,
+    )
+
+    assert missed_index < adapter_index
+
+    missed_block = source[
+        missed_index:adapter_index
+    ]
+
+    assert (
+        "event_processor.process("
+        in missed_block
+    )
+    assert (
+        "missed_eagle_signal_ids.discard("
+        in missed_block
+    )
+    assert (
+        "execution_client.submit("
+        not in missed_block
+    )
+    assert (
+        "execution_client.submit_reserved("
+        not in missed_block
+    )
+
+
+def test_missed_trade_policy_explicitly_waits_for_next_fresh_entry() -> None:
+    """Operator output must explain that BTS resumes on the next new BTC entry."""
+
+    source = script_source()
+
+    assert "BTS will trade the next fresh BTC fund.entry " in source
+    assert "normally." in source
+
+    assert "BTS remains flat and ready for the " in source
+    assert "next fresh BTC fund.entry." in source
