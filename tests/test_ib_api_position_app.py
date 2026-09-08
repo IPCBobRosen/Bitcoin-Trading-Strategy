@@ -1254,10 +1254,10 @@ def test_information_error_callback_does_not_trip_kill_switch(
     assert app.kill_switch.active is False
 
 
-def test_connection_loss_error_trips_kill_switch(
+def test_connection_loss_error_blocks_connectivity_without_emergency_kill_switch(
     tmp_path,
 ) -> None:
-    """IB 1100 callback should block BTS trading."""
+    """Recoverable IB connectivity loss must not become a permanent kill."""
 
     ledger = ExecutionLedger(
         tmp_path
@@ -1283,13 +1283,53 @@ def test_connection_loss_error_trips_kill_switch(
         is IBErrorSeverity.CONNECTION_LOST
     )
 
-    assert app.kill_switch.active is True
+    assert app.kill_switch.active is False
 
 
-def test_connection_restoration_does_not_reset_kill_switch(
+
+def test_connection_loss_invalidates_api_readiness_without_emergency_kill_switch(
     tmp_path,
 ) -> None:
-    """Restored IB connectivity must not silently resume trading."""
+    """Recoverable IB connection loss must immediately invalidate API readiness."""
+
+    ledger = ExecutionLedger(
+        tmp_path
+        / "execution_ledger.db"
+    )
+
+    app = IBApiPositionApp(
+        IBBrokerClient(),
+        execution_ledger=ledger,
+    )
+
+    app.nextValidId(100)
+
+    assert app.api_ready.ready is True
+    assert app.kill_switch.active is False
+
+    app.error(
+        reqId=-1,
+        errorTime=1770000000,
+        errorCode=1100,
+        errorString="Connectivity between IB and TWS lost.",
+    )
+
+    assert app.last_error_result is not None
+
+    assert (
+        app.last_error_result.severity
+        is IBErrorSeverity.CONNECTION_LOST
+    )
+
+    assert app.kill_switch.active is False
+    assert app.api_ready.ready is False
+    assert app.api_ready.next_valid_order_id is None
+
+
+def test_connection_restoration_remains_recoverable_without_emergency_kill_switch(
+    tmp_path,
+) -> None:
+    """IB restoration should remain separate from emergency protection."""
 
     ledger = ExecutionLedger(
         tmp_path
@@ -1308,7 +1348,7 @@ def test_connection_restoration_does_not_reset_kill_switch(
         errorString="Connectivity lost.",
     )
 
-    assert app.kill_switch.active is True
+    assert app.kill_switch.active is False
 
     app.error(
         reqId=-1,
@@ -1324,7 +1364,7 @@ def test_connection_restoration_does_not_reset_kill_switch(
         is IBErrorSeverity.CONNECTION_RESTORED
     )
 
-    assert app.kill_switch.active is True
+    assert app.kill_switch.active is False
 
 
 def test_known_order_rejection_flows_through_error_callback(

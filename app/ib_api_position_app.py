@@ -13,6 +13,7 @@ from app.ib_broker_client import IBBrokerClient
 from app.ib_error_handler import (
     IBErrorHandler,
     IBErrorResult,
+    IBErrorSeverity,
 )
 from app.ib_execution_details_transport import (
     IBExecutionDetailsTransport,
@@ -418,6 +419,13 @@ class IBApiPositionApp(EWrapper, EClient):
                 message=message,
             )
         )
+
+        if (
+            self._last_error_result.severity
+            is IBErrorSeverity.CONNECTION_LOST
+        ):
+            self._position_request_active = False
+            self._api_ready.reset()
 
     def position(
         self,

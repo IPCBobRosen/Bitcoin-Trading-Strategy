@@ -1554,7 +1554,7 @@ def test_script_does_not_hardcode_august_contract_for_submission() -> None:
 
 
 def test_all_submission_paths_use_runtime_contract_month() -> None:
-    """Recovery, reserved-close, and normal paths must share one contract."""
+    """All four submission paths must use the runtime-selected contract."""
 
     source = script_source()
 
@@ -1562,7 +1562,7 @@ def test_all_submission_paths_use_runtime_contract_month() -> None:
         source.count(
             "contract_month=execution_config.contract_month"
         )
-        == 3
+        == 4
     )
 
 
@@ -3011,3 +3011,335 @@ def test_missed_trade_policy_explicitly_waits_for_next_fresh_entry() -> None:
 
     assert "BTS remains flat and ready for the " in source
     assert "next fresh BTC fund.entry." in source
+
+def test_runner_has_ib_recovery_boundary_that_does_not_terminate_eagle_listener() -> None:
+    """Transient IB loss must be handled inside the continuous message loop."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    loop_index = source.index(
+        "async for message in eagle_client.listen():",
+        runner_index,
+    )
+
+    assert "recover_ib_connection" in source[runner_index:loop_index]
+
+    loop_source = source[loop_index:]
+
+    assert "await asyncio.to_thread(" in loop_source
+    assert "recover_ib_connection" in loop_source
+    assert "except (" in loop_source
+    assert "ConnectionError" in loop_source
+    assert "TimeoutError" in loop_source
+    assert "IB CONNECTION LOST" in loop_source
+    assert "continue" in loop_source
+
+def test_live_entry_checks_ib_recovery_before_broker_snapshot() -> None:
+    """A fresh live opening event must re-check IB before normal broker refresh."""
+
+    source = script_source()
+
+    live_index = source.index(
+        "# LIVE lifecycle event."
+    )
+    closing_boundary_index = source.index(
+        "if armed and is_closing_intent:",
+        live_index,
+    )
+
+    # The dedicated close branch ends with `continue`. The next broker refresh
+    # is the common non-closing path used by opening intents.
+    entry_refresh_anchor = (
+        "                        continue\n\n"
+        "                    refresh_position_snapshot("
+    )
+    entry_refresh_index = source.index(
+        entry_refresh_anchor,
+        closing_boundary_index,
+    )
+
+    entry_boundary_source = source[
+        closing_boundary_index:entry_refresh_index
+    ]
+
+    assert "manager.ready" in entry_boundary_source
+    assert "await asyncio.to_thread(" in entry_boundary_source
+    assert "recover_ib_connection" in entry_boundary_source
+    assert "ConnectionError" in entry_boundary_source
+    assert "TimeoutError" in entry_boundary_source
+
+def test_live_exit_preserves_reserved_obligation_and_recovers_ib_before_submission() -> None:
+    """A live exit must recover IB after reservation and before broker submission."""
+
+    source = script_source()
+
+    live_index = source.index(
+        "# LIVE lifecycle event."
+    )
+    close_index = source.index(
+        "if armed and is_closing_intent:",
+        live_index,
+    )
+    reserve_index = source.index(
+        "execution_client.reserve_execution(",
+        close_index,
+    )
+    submit_index = source.index(
+        "execution_client.submit_reserved(",
+        reserve_index,
+    )
+
+    exit_recovery_source = source[
+        reserve_index:submit_index
+    ]
+
+    # The durable close obligation must exist before any recovery attempt.
+    assert reserve_index < submit_index
+    assert "manager.ready" in exit_recovery_source
+    assert "await asyncio.to_thread(" in exit_recovery_source
+    assert "recover_ib_connection" in exit_recovery_source
+    assert "ConnectionError" in exit_recovery_source
+    assert "TimeoutError" in exit_recovery_source
+
+    # A transport outage must not convert a real BTS-held exit into the
+    # missed-entry policy.
+    assert "missed_eagle_signal_ids.add(" not in exit_recovery_source
+    assert "ENTRY MARKED MISSED" not in exit_recovery_source
+
+def test_heartbeat_retries_pending_reserved_exit_after_ib_recovers() -> None:
+    """A later heartbeat must resume a durable RESERVED exit after IB recovery."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    loop_index = source.index(
+        "async for message in eagle_client.listen():",
+        runner_index,
+    )
+    heartbeat_index = source.index(
+        "if isinstance(message, EagleHeartbeat)",
+        loop_index,
+    )
+    hello_index = source.index(
+        "if isinstance(message, EagleHello):",
+        heartbeat_index,
+    )
+
+    heartbeat_source = source[
+        heartbeat_index:hello_index
+    ]
+
+    # A heartbeat recovery opportunity must look for an already-durable exit
+    # obligation and route it through an explicit reserved-exit recovery path.
+    assert "find_reserved_exit(" in heartbeat_source
+    assert "recover_reserved_exit" in heartbeat_source
+    assert "await asyncio.to_thread(" in heartbeat_source
+
+    # The heartbeat path must not treat the pending exit like a missed entry.
+    assert "missed_eagle_signal_ids.add(" not in heartbeat_source
+    assert "ENTRY MARKED MISSED" not in heartbeat_source
+
+def test_pending_reserved_exit_recovery_requires_fresh_broker_state_before_submit() -> None:
+    """Stage 5: a pending exit must revalidate real broker state before resubmission."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "def recover_reserved_exit_obligation("
+    )
+    next_boundary = source.index(
+        "\n    try:\n        manager.connect()",
+        helper_index,
+    )
+    helper_source = source[helper_index:next_boundary]
+
+    refresh_index = helper_source.index(
+        "refresh_position_snapshot("
+    )
+    position_index = helper_source.index(
+        "get_mbt_position(",
+        refresh_index,
+    )
+    evaluate_index = helper_source.index(
+        "evaluate_reserved_exit_recovery(",
+        position_index,
+    )
+    submit_index = helper_source.index(
+        "execution_client.submit_reserved(",
+        evaluate_index,
+    )
+
+    # Recovery must be based on a fresh broker snapshot and explicit
+    # reserved-exit recovery decision before any broker submission.
+    assert refresh_index < position_index < evaluate_index < submit_index
+
+    # A broker-flat/manual-close condition must be rejected before submit.
+    assert "if not recovery_decision.allowed:" in helper_source
+    reject_index = helper_source.index(
+        "if not recovery_decision.allowed:"
+    )
+    assert reject_index < submit_index
+
+    # The recovery helper must not mark an exit as a missed entry.
+    assert "missed_eagle_signal_ids.add(" not in helper_source
+    assert "ENTRY MARKED MISSED" not in helper_source
+
+def test_flat_broker_behavior_never_calls_reserved_exit_submitter() -> None:
+    """Behavioral guard: broker-flat recovery must not invoke submission."""
+
+    import scripts.run_real_eagle_ib_paper_trader as runner
+
+    recover_for_snapshot = getattr(
+        runner,
+        "recover_reserved_exit_for_snapshot",
+        None,
+    )
+
+    # Stage 5 deliberately requires a small testable production boundary.
+    # The current nested implementation does not expose this behavior yet.
+    assert callable(recover_for_snapshot)
+
+    request = build_trade_request(
+        intent=TradeIntent.SELL_TO_CLOSE,
+        signal_id="signal-flat-manual-close",
+    )
+
+    open_signal = DurableOpenSignal(
+        signal_id="signal-flat-manual-close",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="signal-flat-manual-close:entry",
+    )
+
+    submit_calls: list[TradeRequest] = []
+
+    def submit_reserved(candidate: TradeRequest) -> None:
+        submit_calls.append(candidate)
+
+    decision = recover_for_snapshot(
+        trade_request=request,
+        broker_position=0,
+        open_signals=(open_signal,),
+        recovery_authorized=True,
+        expected_quantity=1,
+        submit_reserved=submit_reserved,
+    )
+
+    assert decision.allowed is False
+    assert "flat" in decision.reason.lower()
+    assert submit_calls == []
+
+def test_matching_broker_position_allows_exactly_one_reserved_exit_submission() -> None:
+    """Behavioral guard: matching broker state permits one reserved-exit submit."""
+
+    import scripts.run_real_eagle_ib_paper_trader as runner
+
+    request = build_trade_request(
+        intent=TradeIntent.SELL_TO_CLOSE,
+        signal_id="signal-matching-long-exit",
+    )
+
+    open_signal = DurableOpenSignal(
+        signal_id="signal-matching-long-exit",
+        state=SignalLifecycleState.LONG_OPEN,
+        last_event_id="signal-matching-long-exit:entry",
+    )
+
+    submit_calls: list[TradeRequest] = []
+
+    def submit_reserved(candidate: TradeRequest) -> None:
+        submit_calls.append(candidate)
+
+    decision = runner.recover_reserved_exit_for_snapshot(
+        trade_request=request,
+        broker_position=1,
+        open_signals=(open_signal,),
+        recovery_authorized=True,
+        expected_quantity=1,
+        submit_reserved=submit_reserved,
+    )
+
+    assert decision.allowed is True
+    assert submit_calls == [request]
+
+def test_ambiguous_submitted_exit_is_never_submitted_again() -> None:
+    """Stage 6: an already-SUBMITTED exit must never be retried blindly."""
+
+    import scripts.run_real_eagle_ib_paper_trader as runner
+
+    guard = getattr(
+        runner,
+        "guard_reserved_exit_resubmission",
+        None,
+    )
+
+    # Stage 6 requires an explicit execution-state guard that can be
+    # behaviorally tested and then wired into the real heartbeat path.
+    assert callable(guard)
+
+    submit_calls: list[str] = []
+
+    def submit_again() -> None:
+        submit_calls.append("submitted")
+
+    allowed = guard(
+        execution_status=ExecutionStatus.SUBMITTED,
+        submit_reserved=submit_again,
+    )
+
+    assert allowed is False
+    assert submit_calls == []
+
+def test_real_reserved_exit_recovery_uses_ambiguous_submit_guard() -> None:
+    """Stage 6: the real heartbeat recovery path must use the resubmit guard."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "def recover_reserved_exit_obligation("
+    )
+    next_boundary = source.index(
+        "\n    try:\n        manager.connect()",
+        helper_index,
+    )
+    helper_source = source[helper_index:next_boundary]
+
+    # The real recovery path must consult durable execution state and route
+    # the actual submission through the Stage 6 anti-resubmission guard.
+    assert "execution_ledger.get(" in helper_source
+    assert "guard_reserved_exit_resubmission(" in helper_source
+
+    guard_index = helper_source.index(
+        "guard_reserved_exit_resubmission("
+    )
+
+    # submit_reserved lives inside a nested callback. Textually it is defined
+    # before the guard call, but execution of that callback must be reachable
+    # only through the guarded callback chain.
+    callback_index = helper_source.index(
+        "def submit_revalidated_reserved_exit("
+    )
+    callback_submit_index = helper_source.index(
+        "execution_client.submit_reserved(",
+        callback_index,
+    )
+    guarded_callback_index = helper_source.index(
+        "def submit_after_execution_state_guard()",
+        callback_submit_index,
+    )
+    guarded_recovery_index = helper_source.index(
+        "recover_reserved_exit_for_snapshot(",
+        guarded_callback_index,
+    )
+
+    assert callback_index < callback_submit_index
+    assert callback_submit_index < guarded_callback_index
+    assert guarded_callback_index < guarded_recovery_index < guard_index
+    assert "submit_reserved=submit_after_execution_state_guard" in helper_source[
+        guard_index:
+    ]
+

@@ -74,6 +74,7 @@ class IBErrorHandler:
     }
 
     _CONNECTION_LOST_CODES = {
+        502,
         1100,
         2110,
     }
@@ -87,7 +88,6 @@ class IBErrorHandler:
         100,
         103,
         1300,
-        502,
         503,
         504,
         507,
@@ -204,11 +204,6 @@ class IBErrorHandler:
             normalized_error_code
             in self._CONNECTION_LOST_CODES
         ):
-            self._activate_kill_switch(
-                error_code=normalized_error_code,
-                message=normalized_message,
-            )
-
             return self._result(
                 request_id=normalized_request_id,
                 error_code=normalized_error_code,
@@ -216,8 +211,10 @@ class IBErrorHandler:
                 severity=IBErrorSeverity.CONNECTION_LOST,
                 execution_record=None,
                 reason=(
-                    "IB connectivity loss requires BTS "
-                    "trading to remain blocked."
+                    "IB connectivity was lost. "
+                    "Broker execution must remain unavailable until "
+                    "connectivity, API readiness, broker position, "
+                    "and BTS reconciliation are revalidated."
                 ),
             )
 

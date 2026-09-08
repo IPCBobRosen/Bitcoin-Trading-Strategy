@@ -11,17 +11,17 @@ Sequence:
         ↓
     IB error 1100
         ↓
-    kill switch activates
+    API readiness is invalidated
         ↓
     trading readiness is revoked
         ↓
     IB error 1102
         ↓
-    kill switch remains active
+    API readiness remains invalid
         ↓
     execution remains blocked
         ↓
-    explicit reconciliation + operator reset
+    fresh nextValidId + fresh position snapshot
         ↓
     readiness restored
 """
@@ -72,12 +72,12 @@ class IBUnexpectedDisconnectResult:
             self.initially_ready
             and self.loss_severity
             is IBErrorSeverity.CONNECTION_LOST
-            and self.kill_switch_after_loss
+            and not self.kill_switch_after_loss
             and not self.ready_after_loss
             and self.execution_blocked_after_loss
             and self.restore_severity
             is IBErrorSeverity.CONNECTION_RESTORED
-            and self.kill_switch_after_restore
+            and not self.kill_switch_after_restore
             and not self.ready_after_restore
             and self.execution_blocked_after_restore
             and not self.kill_switch_after_manual_reset
@@ -127,11 +127,11 @@ def require_execution_blocked(
         )
 
     if (
-        IBReadinessFailure.KILL_SWITCH_ACTIVE
+        IBReadinessFailure.API_NOT_READY
         not in result.failures
     ):
         raise RuntimeError(
-            "Trading was blocked, but KillSwitchActive "
+            "Trading was blocked, but ApiNotReady "
             "was not reported."
         )
 
@@ -146,7 +146,7 @@ def require_execution_blocked(
 
     raise RuntimeError(
         "Safety violation: require_ready() permitted "
-        "execution while the kill switch was active."
+        "execution while IB API readiness was invalid."
     )
 
 
@@ -262,17 +262,20 @@ def run_unexpected_disconnect_simulation(
     )
 
     # ---------------------------------------------------------
-    # Simulate completed operator reconciliation.
+    # Simulate a fresh completed IB API handshake and broker snapshot.
     #
-    # At this point:
-    # - broker position is known flat;
-    # - execution state is explicitly declared clear;
-    # - connectivity has been restored.
-    #
-    # Only now is the kill switch explicitly reset.
+    # A restoration callback alone is not trading authorization.
+    # BTS must receive a fresh nextValidId and refresh broker state
+    # before the mandatory readiness gate can pass again.
     # ---------------------------------------------------------
 
-    kill_switch.reset()
+    app.nextValidId(
+        SIMULATED_NEXT_VALID_ID + 1
+    )
+
+    complete_empty_position_snapshot(
+        app
+    )
 
     ready_after_manual_reset = (
         readiness.require_ready(
@@ -285,7 +288,9 @@ def run_unexpected_disconnect_simulation(
         initially_ready=initial.ready,
 
         loss_severity=loss_result.severity,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=(
+            kill_switch.active
+        ),
         ready_after_loss=(
             ready_after_loss.ready
         ),
@@ -296,7 +301,9 @@ def run_unexpected_disconnect_simulation(
         restore_severity=(
             restore_result.severity
         ),
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=(
+            kill_switch.active
+        ),
         ready_after_restore=(
             ready_after_restore.ready
         ),

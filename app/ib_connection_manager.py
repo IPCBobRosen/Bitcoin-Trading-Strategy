@@ -180,6 +180,80 @@ class IBConnectionManager:
 
         self._wait_until_ready()
 
+    def reconnect(self) -> None:
+        """Reconnect after a lost or incomplete IB API connection."""
+
+        if self.ready:
+            raise RuntimeError(
+                "IB API application is already ready."
+            )
+
+        # Fully clean up the previous API session before starting a new
+        # one. This also joins any still-running IB network thread so a
+        # reconnect cannot leave an orphaned network loop behind.
+        self.disconnect()
+
+        # connect() resets stale API-readiness state and requires a fresh
+        # nextValidId callback before the manager can become ready again.
+        self.connect()
+
+    def reconnect_with_retries(
+        self,
+        *,
+        max_attempts: int,
+        retry_delay_seconds: float,
+    ) -> None:
+        """Reconnect repeatedly until ready or attempts are exhausted."""
+
+        if (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or max_attempts <= 0
+        ):
+            raise ValueError(
+                "'max_attempts' must be a positive integer."
+            )
+
+        if (
+            isinstance(retry_delay_seconds, bool)
+            or not isinstance(
+                retry_delay_seconds,
+                (int, float),
+            )
+            or retry_delay_seconds < 0
+        ):
+            raise ValueError(
+                "'retry_delay_seconds' must be non-negative."
+            )
+
+        last_error: Exception | None = None
+
+        for attempt_number in range(
+            1,
+            max_attempts + 1,
+        ):
+            try:
+                self.reconnect()
+                return
+            except Exception as error:
+                last_error = error
+
+                if attempt_number >= max_attempts:
+                    raise
+
+                self._sleep_function(
+                    float(retry_delay_seconds)
+                )
+
+        # Defensive guard: the loop above either returns on success
+        # or re-raises the final reconnect failure.
+        if last_error is not None:
+            raise last_error
+
+        raise RuntimeError(
+            "IB reconnect attempts ended unexpectedly."
+        )
+
     def disconnect(self) -> None:
         """Disconnect from IBKR and clear local connection state."""
 

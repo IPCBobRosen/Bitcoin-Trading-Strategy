@@ -12,7 +12,7 @@ It tests the real IB system-message lifecycle:
         ↓
     TWS reports IB error 1100
         ↓
-    BTS kill switch activates
+    BTS API readiness is invalidated
         ↓
     execution readiness is blocked
         ↓
@@ -20,13 +20,9 @@ It tests the real IB system-message lifecycle:
         ↓
     TWS reports IB error 1101 or 1102
         ↓
-    kill switch remains active
+    API readiness remains invalid
         ↓
-    fresh broker position snapshot confirms FLAT
-        ↓
-    operator explicitly types RESET
-        ↓
-    kill switch resets
+    fresh API handshake + broker position snapshot
         ↓
     BTS readiness returns
 
@@ -199,11 +195,11 @@ class IBRealUnexpectedDisconnectResult:
             self.initially_ready
             and self.initial_position_count == 0
             and self.saw_error_1100
-            and self.kill_switch_after_loss
+            and not self.kill_switch_after_loss
             and not self.readiness_after_loss
             and self.execution_blocked_after_loss
             and self.saw_restore_1101_or_1102
-            and self.kill_switch_after_restore
+            and not self.kill_switch_after_restore
             and not self.readiness_after_restore
             and self.execution_blocked_after_restore
             and self.post_restore_position_count == 0
@@ -338,12 +334,12 @@ def require_execution_blocked(
         )
 
     if (
-        IBReadinessFailure.KILL_SWITCH_ACTIVE
+        IBReadinessFailure.API_NOT_READY
         not in result.failures
     ):
         raise RuntimeError(
-            "KillSwitchActive was not reported "
-            "during the connectivity emergency."
+            "ApiNotReady was not reported "
+            "during the connectivity interruption."
         )
 
     try:
@@ -492,7 +488,7 @@ def run_real_unexpected_disconnect_test(
                 app.has_seen_error_code(
                     1100
                 )
-                and kill_switch.active
+                and not app.api_ready.ready
             ),
             description=(
                 "real IB error 1100 connectivity loss"
@@ -518,7 +514,7 @@ def run_real_unexpected_disconnect_test(
             "IB 1100 RECEIVED."
         )
         print(
-            "Kill switch is ACTIVE and execution "
+            "API readiness is INVALID and execution "
             "is BLOCKED."
         )
         print()
@@ -564,15 +560,20 @@ def run_real_unexpected_disconnect_test(
             )
         )
 
-        if not kill_switch.active:
+        if kill_switch.active:
             raise RuntimeError(
-                "Safety violation: connectivity restoration "
-                "automatically cleared the kill switch."
+                "Recoverable connectivity restoration "
+                "must not require an emergency kill reset."
             )
 
         # -----------------------------------------------------
-        # Fresh post-recovery broker reconciliation.
+        # Fresh post-recovery API handshake and reconciliation.
         # -----------------------------------------------------
+
+        # A restoration callback alone does not restore API readiness.
+        # Re-establish the local API session so BTS receives a fresh
+        # nextValidId before broker state is trusted again.
+        manager.reconnect()
 
         manager.request_position_snapshot()
 
@@ -597,7 +598,7 @@ def run_real_unexpected_disconnect_test(
             "POST-RESTORE POSITION SNAPSHOT: FLAT."
         )
         print(
-            "Kill switch is intentionally STILL ACTIVE."
+            "Fresh API handshake and FLAT snapshot completed."
         )
 
         operator_reset_confirmed = (
@@ -608,10 +609,8 @@ def run_real_unexpected_disconnect_test(
 
         if not operator_reset_confirmed:
             raise RuntimeError(
-                "Operator did not confirm kill-switch reset."
+                "Operator did not confirm completed recovery checks."
             )
-
-        kill_switch.reset()
 
         final_readiness = (
             readiness.require_ready(
@@ -633,7 +632,9 @@ def run_real_unexpected_disconnect_test(
                     1100
                 )
             ),
-            kill_switch_after_loss=True,
+            kill_switch_after_loss=(
+                kill_switch.active
+            ),
             readiness_after_loss=(
                 loss_readiness.ready
             ),
@@ -644,7 +645,9 @@ def run_real_unexpected_disconnect_test(
             saw_restore_1101_or_1102=(
                 app.has_seen_connection_restore()
             ),
-            kill_switch_after_restore=True,
+            kill_switch_after_restore=(
+                kill_switch.active
+            ),
             readiness_after_restore=(
                 restore_readiness.ready
             ),

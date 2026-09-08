@@ -32,11 +32,11 @@ def create_success_result() -> IBUnexpectedDisconnectResult:
     return IBUnexpectedDisconnectResult(
         initially_ready=True,
         loss_severity=IBErrorSeverity.CONNECTION_LOST,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         ready_after_loss=False,
         execution_blocked_after_loss=True,
         restore_severity=IBErrorSeverity.CONNECTION_RESTORED,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         ready_after_restore=False,
         execution_blocked_after_restore=True,
         kill_switch_after_manual_reset=False,
@@ -105,15 +105,15 @@ def test_success_result_is_successful() -> None:
     )
 
 
-def test_loss_must_activate_kill_switch() -> None:
-    """Failure state is invalid if emergency protection remains off."""
+def test_recoverable_loss_must_not_activate_kill_switch() -> None:
+    """Recoverable connectivity loss must not create a permanent emergency."""
 
     result = create_success_result()
 
     changed = IBUnexpectedDisconnectResult(
         initially_ready=result.initially_ready,
         loss_severity=result.loss_severity,
-        kill_switch_after_loss=False,
+        kill_switch_after_loss=True,
         ready_after_loss=result.ready_after_loss,
         execution_blocked_after_loss=(
             result.execution_blocked_after_loss
@@ -145,11 +145,11 @@ def test_loss_must_revoke_readiness() -> None:
     changed = IBUnexpectedDisconnectResult(
         initially_ready=result.initially_ready,
         loss_severity=result.loss_severity,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         ready_after_loss=True,
         execution_blocked_after_loss=True,
         restore_severity=result.restore_severity,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         ready_after_restore=False,
         execution_blocked_after_restore=True,
         kill_switch_after_manual_reset=False,
@@ -159,19 +159,19 @@ def test_loss_must_revoke_readiness() -> None:
     assert changed.successful is False
 
 
-def test_restoration_must_not_clear_kill_switch() -> None:
-    """IB 1102 alone must never resume BTS."""
+def test_restoration_must_not_activate_kill_switch() -> None:
+    """IB 1102 must not create an emergency kill state."""
 
     result = create_success_result()
 
     changed = IBUnexpectedDisconnectResult(
         initially_ready=result.initially_ready,
         loss_severity=result.loss_severity,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         ready_after_loss=False,
         execution_blocked_after_loss=True,
         restore_severity=result.restore_severity,
-        kill_switch_after_restore=False,
+        kill_switch_after_restore=True,
         ready_after_restore=False,
         execution_blocked_after_restore=True,
         kill_switch_after_manual_reset=False,
@@ -189,11 +189,11 @@ def test_restoration_must_not_restore_readiness_automatically() -> None:
     changed = IBUnexpectedDisconnectResult(
         initially_ready=result.initially_ready,
         loss_severity=result.loss_severity,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         ready_after_loss=False,
         execution_blocked_after_loss=True,
         restore_severity=result.restore_severity,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         ready_after_restore=True,
         execution_blocked_after_restore=True,
         kill_switch_after_manual_reset=False,
@@ -203,19 +203,19 @@ def test_restoration_must_not_restore_readiness_automatically() -> None:
     assert changed.successful is False
 
 
-def test_manual_reset_must_clear_kill_switch() -> None:
-    """Explicit operator recovery should eventually clear emergency."""
+def test_recovery_must_not_introduce_kill_switch() -> None:
+    """Successful reconnect recovery must leave emergency protection inactive."""
 
     result = create_success_result()
 
     changed = IBUnexpectedDisconnectResult(
         initially_ready=result.initially_ready,
         loss_severity=result.loss_severity,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         ready_after_loss=False,
         execution_blocked_after_loss=True,
         restore_severity=result.restore_severity,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         ready_after_restore=False,
         execution_blocked_after_restore=True,
         kill_switch_after_manual_reset=True,
@@ -225,22 +225,22 @@ def test_manual_reset_must_clear_kill_switch() -> None:
     assert changed.successful is False
 
 
-def test_manual_reset_must_restore_readiness() -> None:
-    """Recovery is incomplete until readiness returns."""
+def test_fresh_handshake_must_restore_readiness() -> None:
+    """Recovery is incomplete until fresh API readiness returns."""
 
     result = create_success_result()
 
     changed = IBUnexpectedDisconnectResult(
         initially_ready=result.initially_ready,
         loss_severity=result.loss_severity,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         ready_after_loss=False,
         execution_blocked_after_loss=True,
         restore_severity=result.restore_severity,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         ready_after_restore=False,
         execution_blocked_after_restore=True,
-        kill_switch_after_manual_reset=False,
+        kill_switch_after_manual_reset=True,
         ready_after_manual_reset=False,
     )
 
@@ -313,10 +313,10 @@ def test_initial_environment_is_ready(
     assert result.ready is True
 
 
-def test_ib_1100_activates_kill_switch(
+def test_ib_1100_invalidates_api_readiness_without_kill_switch(
     tmp_path,
 ) -> None:
-    """Official connection-loss code must trip emergency protection."""
+    """Official connection loss must revoke API readiness without emergency kill."""
 
     (
         app,
@@ -336,7 +336,8 @@ def test_ib_1100_activates_kill_switch(
         errorString="Connectivity lost.",
     )
 
-    assert kill_switch.active is True
+    assert kill_switch.active is False
+    assert app.api_ready.ready is False
 
     assert app.last_error_result is not None
 
@@ -349,7 +350,7 @@ def test_ib_1100_activates_kill_switch(
 def test_ib_1100_blocks_readiness(
     tmp_path,
 ) -> None:
-    """Kill switch should immediately remove trading readiness."""
+    """Invalid API readiness should immediately block trading."""
 
     (
         app,
@@ -377,7 +378,7 @@ def test_ib_1100_blocks_readiness(
     assert result.ready is False
 
     assert (
-        IBReadinessFailure.KILL_SWITCH_ACTIVE
+        IBReadinessFailure.API_NOT_READY
         in result.failures
     )
 
@@ -413,10 +414,10 @@ def test_mandatory_gate_rejects_after_1100(
     )
 
 
-def test_ib_1102_does_not_reset_kill_switch(
+def test_ib_1102_does_not_activate_kill_switch(
     tmp_path,
 ) -> None:
-    """Connectivity restoration must not automatically resume trading."""
+    """Connectivity restoration must not create an emergency kill state."""
 
     (
         app,
@@ -443,7 +444,7 @@ def test_ib_1102_does_not_reset_kill_switch(
         errorString="Connectivity restored.",
     )
 
-    assert kill_switch.active is True
+    assert kill_switch.active is False
 
     assert app.last_error_result is not None
 
@@ -491,15 +492,15 @@ def test_ib_1102_remains_not_ready(
     assert result.ready is False
 
     assert (
-        IBReadinessFailure.KILL_SWITCH_ACTIVE
+        IBReadinessFailure.API_NOT_READY
         in result.failures
     )
 
 
-def test_manual_reset_restores_ready_state_after_reconciliation(
+def test_fresh_handshake_restores_ready_state_after_reconciliation(
     tmp_path,
 ) -> None:
-    """Explicit reset should work only after surrounding checks are clear."""
+    """Fresh API handshake should restore readiness only after checks are clear."""
 
     (
         app,
@@ -526,7 +527,10 @@ def test_manual_reset_restores_ready_state_after_reconciliation(
         errorString="Connectivity restored.",
     )
 
-    kill_switch.reset()
+    app.nextValidId(
+        SIMULATED_NEXT_VALID_ID + 1
+    )
+    complete_empty_position_snapshot(app)
 
     result = readiness.require_ready(
         positions_reconciled=True,

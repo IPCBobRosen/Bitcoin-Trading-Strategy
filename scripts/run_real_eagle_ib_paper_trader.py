@@ -42,6 +42,7 @@ from app.communications.eagle_trade_adapter import (
 from app.communications.eagle_update import EagleUpdate
 from app.communications.incoming_event import IncomingLifecycleEvent
 from app.communications.protocol import TradeIntent
+from app.communications.trade_request import TradeRequest
 from app.daily_loss_guard import DailyLossGuard
 from app.duplicate_order_guard import DuplicateOrderGuard
 from app.event_processor import EventProcessStatus, EventProcessor
@@ -1080,6 +1081,48 @@ def _record_replay_frame(
     return replay_processed, replay_processed >= replay_expected
 
 
+
+
+def guard_reserved_exit_resubmission(
+    *,
+    execution_status: ExecutionStatus,
+    submit_reserved: Callable[[], None],
+) -> bool:
+    """Allow submission only while the durable execution is still RESERVED."""
+
+    if execution_status is not ExecutionStatus.RESERVED:
+        return False
+
+    submit_reserved()
+    return True
+
+
+def recover_reserved_exit_for_snapshot(
+    *,
+    trade_request: TradeRequest,
+    broker_position: int,
+    open_signals: tuple[DurableOpenSignal, ...] | list[DurableOpenSignal],
+    recovery_authorized: bool,
+    expected_quantity: int,
+    submit_reserved: Callable[[TradeRequest], None],
+):
+    """Submit a reserved exit only when fresh broker/lifecycle state allows it."""
+
+    decision = evaluate_reserved_exit_recovery(
+        trade_request=trade_request,
+        broker_position=broker_position,
+        open_signals=open_signals,
+        recovery_authorized=recovery_authorized,
+        expected_quantity=expected_quantity,
+    )
+
+    if not decision.allowed:
+        return decision
+
+    submit_reserved(trade_request)
+    return decision
+
+
 async def run_continuous_paper_trader(
     *,
     armed: bool,
@@ -1202,6 +1245,285 @@ async def run_continuous_paper_trader(
     # was offline and must never be chased or reconstructed into broker
     # exposure.
     missed_eagle_signal_ids: set[str] = set()
+
+    def recover_ib_connection(
+        *,
+        reserved_exit_event_id: str | None = None,
+    ) -> None:
+        """Recover and fully revalidate a transient IB/TWS connection loss."""
+
+        if manager.ready:
+            return
+
+        print()
+        print("IB CONNECTION LOST - RECOVERY CHECK ACTIVE")
+        print(
+            "Entries remain blocked while BTS re-establishes and "
+            "revalidates the paper TWS connection."
+        )
+
+        manager.reconnect_with_retries(
+            max_attempts=6,
+            retry_delay_seconds=10.0,
+        )
+
+        apply_durable_order_id_floor(
+            execution_ledger=execution_ledger,
+            order_id_allocator=app.order_id_allocator,
+        )
+
+        refresh_position_snapshot(
+            app=app,
+            manager=manager,
+            broker_client=broker_client,
+        )
+
+        if reserved_exit_event_id is None:
+            require_execution_state_clear(execution_ledger)
+        else:
+            reserved_exit = find_reserved_exit(execution_ledger)
+
+            if (
+                reserved_exit is None
+                or reserved_exit.event_id != reserved_exit_event_id
+            ):
+                raise RuntimeError(
+                    "IB recovery expected one specific RESERVED exit, "
+                    "but durable execution state did not match."
+                )
+
+        reconcile_broker_and_lifecycle(
+            broker_client=broker_client,
+            lifecycle_database_path=lifecycle_database_path,
+            expected_local_symbol=execution_config.local_symbol,
+            expected_quantity=execution_config.quantity,
+        )
+
+        if kill_switch.active:
+            raise RuntimeError(
+                "IB connection returned, but the emergency kill switch "
+                f"is active: {kill_switch.reason}"
+            )
+
+        print("IB PAPER CONNECTION RECOVERED AND REVALIDATED")
+
+    def recover_reserved_exit_obligation(
+        reserved_exit: ReservedExitRecord,
+    ) -> None:
+        """Safely fulfill one in-session durable RESERVED exit."""
+
+        nonlocal broker_submissions
+        nonlocal filled_orders
+        nonlocal approved_decisions
+
+        recovery_trade_request = execution_ledger.get_trade_request(
+            reserved_exit.event_id
+        )
+
+        if recovery_trade_request is None:
+            raise RuntimeError(
+                "RESERVED exit has no recoverable TradeRequest."
+            )
+
+        recovery_execution_record = execution_ledger.get(
+            reserved_exit.event_id
+        )
+
+        if recovery_execution_record is None:
+            raise RuntimeError(
+                "RESERVED exit has no durable execution record."
+            )
+
+        refresh_position_snapshot(
+            app=app,
+            manager=manager,
+            broker_client=broker_client,
+        )
+
+        recovery_position = get_mbt_position(
+            broker_client,
+            expected_local_symbol=execution_config.local_symbol,
+        )
+        recovery_open_signals = load_durable_open_signals(
+            lifecycle_database_path
+        )
+
+        recovery_decision = evaluate_reserved_exit_recovery(
+            trade_request=recovery_trade_request,
+            broker_position=recovery_position,
+            open_signals=recovery_open_signals,
+            # This exit was reserved by this continuously armed BTS process.
+            # The authorization comes from the already-armed live paper session,
+            # not from the startup-only --recover-reserved-exit switch.
+            recovery_authorized=armed,
+            expected_quantity=execution_config.quantity,
+        )
+
+        print()
+        print("PENDING RESERVED EXIT RECOVERY CHECK")
+        print("=" * 72)
+        print(f"Event ID:         {reserved_exit.event_id}")
+        print(f"Signal ID:        {reserved_exit.signal_id}")
+        print(f"Broker position:  {recovery_position}")
+        print(f"Recovery allowed: {recovery_decision.allowed}")
+        print(f"Reason: {recovery_decision.reason}")
+        print("=" * 72)
+
+        if not recovery_decision.allowed:
+            raise RuntimeError(
+                "Pending RESERVED exit recovery rejected: "
+                f"{recovery_decision.reason}"
+            )
+
+        readiness = IBTradingReadiness(
+            api_ready=app.api_ready,
+            order_id_allocator=app.order_id_allocator,
+            broker_client=broker_client,
+            trading_controls=trading_controls,
+            kill_switch=kill_switch,
+        )
+
+        readiness_result = readiness.require_ready(
+            positions_reconciled=True,
+            execution_state_clear=True,
+        )
+
+        print(
+            "IB pending-exit recovery readiness passed: "
+            f"{readiness_result.ready}"
+        )
+
+        broker_order_id = app.order_id_allocator.allocate()
+
+        recovery_submission_holder = []
+
+        def submit_revalidated_reserved_exit(
+            candidate: TradeRequest,
+        ) -> None:
+            recovery_submission_holder.append(
+                execution_client.submit_reserved(
+                    candidate,
+                    contract_month=execution_config.contract_month,
+                    broker_order_id=broker_order_id,
+                )
+            )
+
+        submission_decision_holder = []
+
+        def submit_after_execution_state_guard() -> None:
+            submission_decision_holder.append(
+                recover_reserved_exit_for_snapshot(
+                    trade_request=recovery_trade_request,
+                    broker_position=recovery_position,
+                    open_signals=recovery_open_signals,
+                    recovery_authorized=armed,
+                    expected_quantity=execution_config.quantity,
+                    submit_reserved=submit_revalidated_reserved_exit,
+                )
+            )
+
+        resubmission_allowed = guard_reserved_exit_resubmission(
+            execution_status=recovery_execution_record.status,
+            submit_reserved=submit_after_execution_state_guard,
+        )
+
+        if not resubmission_allowed:
+            raise RuntimeError(
+                "Pending exit is no longer durably RESERVED; BTS will not "
+                "blindly resubmit an ambiguous broker close."
+            )
+
+        if len(submission_decision_holder) != 1:
+            raise RuntimeError(
+                "Pending RESERVED exit did not pass exactly once through "
+                "the broker-state recovery gate."
+            )
+
+        submission_decision = submission_decision_holder[0]
+
+        if not submission_decision.allowed:
+            raise RuntimeError(
+                "Pending RESERVED exit changed state before submission: "
+                f"{submission_decision.reason}"
+            )
+
+        if len(recovery_submission_holder) != 1:
+            raise RuntimeError(
+                "Pending RESERVED exit recovery did not produce exactly "
+                "one broker submission."
+            )
+
+        recovery_submission = recovery_submission_holder[0]
+        broker_submissions += 1
+
+        expected_action = expected_ib_action(recovery_trade_request)
+
+        if recovery_submission.package.order.action != expected_action:
+            raise RuntimeError(
+                "Recovered IB order action does not match TradeRequest."
+            )
+
+        if (
+            recovery_submission.package.order.totalQuantity
+            != execution_config.quantity
+        ):
+            raise RuntimeError(
+                "Recovered IB order quantity does not match approved "
+                "runtime quantity."
+            )
+
+        recovery_final_record = wait_for_execution_resolution(
+            execution_ledger=execution_ledger,
+            event_id=recovery_trade_request.event_id,
+            kill_switch=kill_switch,
+            timeout_seconds=EXECUTION_TIMEOUT_SECONDS,
+        )
+
+        if recovery_final_record.status is not ExecutionStatus.FILLED:
+            raise RuntimeError(
+                "Recovered exit did not reach FILLED. "
+                f"Status: {recovery_final_record.status.value}. "
+                f"Reason: {recovery_final_record.reason}"
+            )
+
+        filled_orders += 1
+
+        recovery_lifecycle_decision = coordinator.commit_request(
+            recovery_trade_request
+        )
+
+        if not recovery_lifecycle_decision.approved:
+            raise RuntimeError(
+                "Recovered broker close FILLED but durable lifecycle "
+                "commit was rejected."
+            )
+
+        approved_decisions += 1
+
+        refresh_position_snapshot(
+            app=app,
+            manager=manager,
+            broker_client=broker_client,
+        )
+
+        recovered_position, recovered_open_signals = (
+            reconcile_broker_and_lifecycle(
+                broker_client=broker_client,
+                lifecycle_database_path=lifecycle_database_path,
+                expected_local_symbol=execution_config.local_symbol,
+                expected_quantity=execution_config.quantity,
+            )
+        )
+
+        if recovered_position != 0 or recovered_open_signals:
+            raise RuntimeError(
+                "Recovered exit fill did not reconcile BTS and broker flat."
+            )
+
+        print()
+        print("PENDING RESERVED EXIT RECOVERED, FILLED, AND RECONCILED.")
+        print("Current MBT position: 0")
+        print("Durable open signals: 0")
 
     try:
         manager.connect()
@@ -1442,6 +1764,71 @@ async def run_continuous_paper_trader(
             messages_observed += 1
             print()
             print("-" * 72)
+
+            # Heartbeats provide a safe opportunity to restore a transient
+            # paper-TWS outage without terminating the Eagle listener. The
+            # reconnect work runs off the asyncio event loop because the IB
+            # connection manager uses synchronous waits between attempts.
+            if isinstance(message, EagleHeartbeat):
+                pending_reserved_exit = find_reserved_exit(
+                    execution_ledger
+                )
+
+                if pending_reserved_exit is not None:
+                    if not manager.ready:
+                        try:
+                            await asyncio.to_thread(
+                                recover_ib_connection,
+                                reserved_exit_event_id=(
+                                    pending_reserved_exit.event_id
+                                ),
+                            )
+                        except (
+                            ConnectionError,
+                            OSError,
+                            TimeoutError,
+                        ) as error:
+                            print()
+                            print(
+                                "IB CONNECTION LOST - RESERVED EXIT PENDING"
+                            )
+                            print(f"{type(error).__name__}: {error}")
+                            print(
+                                "The durable exit remains RESERVED. BTS will "
+                                "retry on a later Eagle heartbeat."
+                            )
+                            continue
+
+                    # Connection recovery succeeded (or IB was already ready).
+                    # Fulfillment is separate from the transport-error catch:
+                    # once a broker order is submitted, an execution timeout
+                    # must fail closed rather than masquerade as a reconnect
+                    # failure and risk a duplicate submission later.
+                    await asyncio.to_thread(
+                        recover_reserved_exit_obligation,
+                        pending_reserved_exit,
+                    )
+
+                elif not manager.ready:
+                    try:
+                        await asyncio.to_thread(
+                            recover_ib_connection
+                        )
+                    except (
+                        ConnectionError,
+                        OSError,
+                        TimeoutError,
+                    ) as error:
+                        print()
+                        print(
+                            "IB CONNECTION LOST - EAGLE LISTENER REMAINS ACTIVE"
+                        )
+                        print(f"{type(error).__name__}: {error}")
+                        print(
+                            "Broker execution remains blocked. BTS will check "
+                            "the paper TWS connection again on a later heartbeat."
+                        )
+                        continue
 
             if isinstance(message, EagleHello):
                 hello_received = True
@@ -1859,6 +2246,34 @@ async def run_continuous_paper_trader(
                         )
                         print("Broker order has NOT been submitted.")
 
+                        if not manager.ready:
+                            try:
+                                await asyncio.to_thread(
+                                    recover_ib_connection,
+                                    reserved_exit_event_id=trade_request.event_id,
+                                )
+                            except (
+                                ConnectionError,
+                                OSError,
+                                TimeoutError,
+                            ) as error:
+                                rejected_decisions += 1
+
+                                print()
+                                print(
+                                    "IB CONNECTION LOST - RESERVED EXIT PENDING"
+                                )
+                                print(f"{type(error).__name__}: {error}")
+                                print(
+                                    "The durable exit obligation remains "
+                                    "RESERVED. No broker order was submitted."
+                                )
+                                print(
+                                    "Eagle listener remains active; BTS will "
+                                    "not convert this exit into a missed entry."
+                                )
+                                continue
+
                         refresh_position_snapshot(
                             app=app,
                             manager=manager,
@@ -2044,6 +2459,71 @@ async def run_continuous_paper_trader(
                         )
 
                         continue
+
+                    # ---------------------------------------------------------
+                    # FRESH ENTRY IB-RECOVERY BOUNDARY
+                    # ---------------------------------------------------------
+                    # A stale local connection flag must not cause BTS to miss
+                    # an otherwise valid fresh Eagle entry. Before the normal
+                    # broker snapshot/readiness path, make a fresh paper-TWS
+                    # recovery attempt. If TWS is still unavailable after the
+                    # bounded recovery cycle, consume this entry as missed so
+                    # BTS will never chase it after reconnect.
+                    if (
+                        armed
+                        and intended_intent
+                        in {
+                            TradeIntent.BUY_TO_OPEN,
+                            TradeIntent.SELL_TO_OPEN,
+                        }
+                        and not manager.ready
+                    ):
+                        try:
+                            await asyncio.to_thread(
+                                recover_ib_connection
+                            )
+                        except (
+                            ConnectionError,
+                            OSError,
+                            TimeoutError,
+                        ) as error:
+                            event_result = event_processor.process(
+                                message
+                            )
+                            print(
+                                f"Event status: {event_result.status.value}"
+                            )
+
+                            if (
+                                event_result.status
+                                is not EventProcessStatus.ACCEPTED
+                            ):
+                                print(
+                                    "Duplicate/out-of-sequence live entry "
+                                    "stopped before missed-entry handling."
+                                )
+                                continue
+
+                            missed_eagle_signal_ids.add(
+                                message.signal_id
+                            )
+                            rejected_decisions += 1
+
+                            print()
+                            print(
+                                "IB CONNECTION LOST - ENTRY MARKED MISSED"
+                            )
+                            print(f"{type(error).__name__}: {error}")
+                            print(
+                                "BTS did not enter this Eagle trade and will "
+                                "not chase it after the paper TWS connection "
+                                "returns."
+                            )
+                            print(
+                                "Eagle listener remains active; the matching "
+                                "exit will be consumed without a broker order."
+                            )
+                            continue
 
                     refresh_position_snapshot(
                         app=app,

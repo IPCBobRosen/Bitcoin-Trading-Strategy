@@ -203,15 +203,16 @@ def test_warning_codes_do_not_automatically_trip_kill_switch(
 @pytest.mark.parametrize(
     "error_code",
     [
+        502,
         1100,
         2110,
     ],
 )
-def test_connection_loss_trips_kill_switch(
+def test_connection_loss_is_recoverable_without_kill_switch(
     tmp_path,
     error_code: int,
 ) -> None:
-    """Loss of IB server connectivity must block trading."""
+    """Recoverable IB connectivity loss must not activate emergency kill."""
 
     handler, _, kill_switch = (
         create_handler(
@@ -230,35 +231,11 @@ def test_connection_loss_trips_kill_switch(
         is IBErrorSeverity.CONNECTION_LOST
     )
 
-    assert result.trading_blocked is True
-    assert kill_switch.active is True
-
-
-def test_connection_loss_records_audit_reason(
-    tmp_path,
-) -> None:
-    """Kill switch should retain the IB code and message."""
-
-    handler, _, kill_switch = (
-        create_handler(
-            tmp_path
-        )
-    )
-
-    handler.handle(
-        request_id=-1,
-        error_code=1100,
-        message="Connectivity between IB and TWS lost.",
-    )
-
-    assert kill_switch.reason is not None
-
-    assert "1100" in kill_switch.reason
-
-    assert (
-        "Connectivity between IB and TWS lost."
-        in kill_switch.reason
-    )
+    # Transport/readiness layers block broker execution during recovery.
+    # The emergency kill switch is reserved for genuine critical failures.
+    assert result.trading_blocked is False
+    assert kill_switch.active is False
+    assert kill_switch.reason is None
 
 
 @pytest.mark.parametrize(
@@ -290,10 +267,10 @@ def test_restoration_is_classified_correctly(
     )
 
 
-def test_restoration_does_not_reset_existing_kill_switch(
+def test_restoration_does_not_reset_existing_critical_kill_switch(
     tmp_path,
 ) -> None:
-    """Reconnect must not silently resume trading."""
+    """Connectivity restoration must not clear a genuine emergency stop."""
 
     handler, _, kill_switch = (
         create_handler(
@@ -301,22 +278,31 @@ def test_restoration_does_not_reset_existing_kill_switch(
         )
     )
 
-    handler.handle(
+    critical = handler.handle(
         request_id=-1,
-        error_code=1100,
-        message="Connectivity lost.",
+        error_code=1300,
+        message="Critical IB socket configuration failure.",
     )
 
+    assert critical.severity is IBErrorSeverity.CRITICAL
+    assert critical.trading_blocked is True
     assert kill_switch.active is True
 
-    result = handler.handle(
+    original_reason = kill_switch.reason
+
+    restored = handler.handle(
         request_id=-1,
         error_code=1102,
         message="Connectivity restored.",
     )
 
-    assert result.trading_blocked is True
+    assert (
+        restored.severity
+        is IBErrorSeverity.CONNECTION_RESTORED
+    )
+    assert restored.trading_blocked is True
     assert kill_switch.active is True
+    assert kill_switch.reason == original_reason
 
 
 @pytest.mark.parametrize(
@@ -325,7 +311,6 @@ def test_restoration_does_not_reset_existing_kill_switch(
         100,
         103,
         1300,
-        502,
         503,
         504,
         507,
@@ -362,7 +347,7 @@ def test_critical_codes_trip_kill_switch(
 def test_first_critical_error_reason_is_preserved(
     tmp_path,
 ) -> None:
-    """KillSwitch should preserve the original IB emergency cause."""
+    """KillSwitch should preserve the first genuine critical IB cause."""
 
     handler, _, kill_switch = (
         create_handler(
@@ -372,19 +357,19 @@ def test_first_critical_error_reason_is_preserved(
 
     handler.handle(
         request_id=-1,
-        error_code=1100,
-        message="First failure.",
+        error_code=1300,
+        message="First critical failure.",
     )
 
     handler.handle(
         request_id=-1,
-        error_code=1300,
-        message="Second failure.",
+        error_code=503,
+        message="Second critical failure.",
     )
 
     assert (
         kill_switch.reason
-        == "IB error 1100: First failure."
+        == "IB error 1300: First critical failure."
     )
 
 

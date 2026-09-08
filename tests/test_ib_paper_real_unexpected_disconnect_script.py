@@ -29,11 +29,11 @@ def create_success_result() -> IBRealUnexpectedDisconnectResult:
         initially_ready=True,
         initial_position_count=0,
         saw_error_1100=True,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         readiness_after_loss=False,
         execution_blocked_after_loss=True,
         saw_restore_1101_or_1102=True,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         readiness_after_restore=False,
         execution_blocked_after_restore=True,
         post_restore_position_count=0,
@@ -154,11 +154,11 @@ def test_missing_restore_fails_result() -> None:
         initially_ready=result.initially_ready,
         initial_position_count=0,
         saw_error_1100=True,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         readiness_after_loss=False,
         execution_blocked_after_loss=True,
         saw_restore_1101_or_1102=False,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         readiness_after_restore=False,
         execution_blocked_after_restore=True,
         post_restore_position_count=0,
@@ -170,8 +170,8 @@ def test_missing_restore_fails_result() -> None:
     assert changed.successful is False
 
 
-def test_restore_cannot_clear_kill_switch() -> None:
-    """Automatic reconnect may not authorize trading."""
+def test_restore_must_not_activate_kill_switch() -> None:
+    """Recoverable restoration must not create an emergency kill state."""
 
     result = create_success_result()
 
@@ -179,11 +179,11 @@ def test_restore_cannot_clear_kill_switch() -> None:
         initially_ready=True,
         initial_position_count=0,
         saw_error_1100=True,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         readiness_after_loss=False,
         execution_blocked_after_loss=True,
         saw_restore_1101_or_1102=True,
-        kill_switch_after_restore=False,
+        kill_switch_after_restore=True,
         readiness_after_restore=False,
         execution_blocked_after_restore=True,
         post_restore_position_count=0,
@@ -204,11 +204,11 @@ def test_post_restore_account_must_be_flat() -> None:
         initially_ready=True,
         initial_position_count=0,
         saw_error_1100=True,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         readiness_after_loss=False,
         execution_blocked_after_loss=True,
         saw_restore_1101_or_1102=True,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         readiness_after_restore=False,
         execution_blocked_after_restore=True,
         post_restore_position_count=1,
@@ -221,7 +221,7 @@ def test_post_restore_account_must_be_flat() -> None:
 
 
 def test_operator_confirmation_is_required() -> None:
-    """Recovery cannot silently reset emergency state."""
+    """Diagnostic harness still requires explicit recovery acknowledgement."""
 
     result = create_success_result()
 
@@ -229,11 +229,11 @@ def test_operator_confirmation_is_required() -> None:
         initially_ready=True,
         initial_position_count=0,
         saw_error_1100=True,
-        kill_switch_after_loss=True,
+        kill_switch_after_loss=False,
         readiness_after_loss=False,
         execution_blocked_after_loss=True,
         saw_restore_1101_or_1102=True,
-        kill_switch_after_restore=True,
+        kill_switch_after_restore=False,
         readiness_after_restore=False,
         execution_blocked_after_restore=True,
         post_restore_position_count=0,
@@ -284,7 +284,8 @@ def test_observer_records_1100(
         is True
     )
 
-    assert kill_switch.active is True
+    assert kill_switch.active is False
+    assert app.api_ready.ready is False
 
     assert (
         IBErrorSeverity.CONNECTION_LOST
@@ -339,10 +340,10 @@ def test_observer_records_restore_codes(
     )
 
 
-def test_restore_does_not_clear_observer_kill_switch(
+def test_restore_does_not_activate_observer_kill_switch(
     tmp_path,
 ) -> None:
-    """Real restoration callback must leave emergency active."""
+    """Real restoration callback must leave emergency kill inactive."""
 
     (
         app,
@@ -367,7 +368,7 @@ def test_restore_does_not_clear_observer_kill_switch(
         errorString="Connectivity restored.",
     )
 
-    assert kill_switch.active is True
+    assert kill_switch.active is False
 
 
 @pytest.mark.parametrize(
