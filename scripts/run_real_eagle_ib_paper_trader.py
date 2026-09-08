@@ -617,6 +617,38 @@ def require_execution_state_clear(execution_ledger: ExecutionLedger) -> None:
         )
 
 
+def apply_durable_order_id_floor(
+    *,
+    execution_ledger: ExecutionLedger,
+    order_id_allocator,
+) -> int | None:
+    """Keep future IB order IDs above all durable BTS broker IDs.
+
+    The allocator must still be initialized by IB nextValidId. Durable history
+    only raises that broker-provided floor; it never replaces the handshake.
+    """
+
+    if not isinstance(execution_ledger, ExecutionLedger):
+        raise TypeError("'execution_ledger' must be an ExecutionLedger.")
+
+    broker_order_ids = tuple(
+        record.broker_order_id
+        for record in execution_ledger.all_records()
+        if record.broker_order_id is not None
+    )
+
+    if not broker_order_ids:
+        return None
+
+    highest_durable_id = max(broker_order_ids)
+
+    order_id_allocator.ensure_minimum_next_id(
+        highest_durable_id + 1
+    )
+
+    return highest_durable_id
+
+
 def find_reserved_exit(
     execution_ledger: ExecutionLedger,
 ) -> ReservedExitRecord | None:
@@ -1186,6 +1218,11 @@ async def run_continuous_paper_trader(
                 f"{kill_switch.reason}"
             )
 
+        highest_durable_broker_order_id = apply_durable_order_id_floor(
+            execution_ledger=execution_ledger,
+            order_id_allocator=app.order_id_allocator,
+        )
+
         refresh_position_snapshot(
             app=app,
             manager=manager,
@@ -1360,7 +1397,15 @@ async def run_continuous_paper_trader(
         print(f"Hard quantity ceiling: {MAX_CONFIGURABLE_QUANTITY}")
         print("-" * 72)
         print(f"TWS API ready:             {app.api_ready.ready}")
-        print(f"Next valid order ID:       {app.api_ready.next_valid_order_id}")
+        print(f"TWS nextValidId:           {app.api_ready.next_valid_order_id}")
+        print(
+            "Highest durable broker ID:  "
+            f"{highest_durable_broker_order_id}"
+        )
+        print(
+            "BTS next allocation ID:     "
+            f"{app.order_id_allocator.next_order_id}"
+        )
         print(f"Starting MBT position:     {starting_position}")
         print(f"Durable open signals:      {len(starting_open_signals)}")
         print(f"Execution state clear:     {execution_state_clear(execution_ledger)}")

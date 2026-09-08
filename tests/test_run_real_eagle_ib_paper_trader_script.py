@@ -16,6 +16,7 @@ from app.execution_ledger import (
     ExecutionLedger,
     ExecutionStatus,
 )
+from app.ib_order_id_allocator import IBOrderIdAllocator
 from app.ib_broker_client import (
     IBBrokerClient,
     IBPositionRecord,
@@ -38,6 +39,7 @@ from scripts.run_real_eagle_ib_paper_trader import (
     IB_PORT,
     MAX_CONFIGURABLE_QUANTITY,
     RECOVERY_ARGUMENT,
+    apply_durable_order_id_floor,
     validate_runtime_execution_config,
     SYMBOL,
     DurableOpenSignal,
@@ -925,6 +927,104 @@ def test_require_execution_state_clear_rejects_unresolved(
             ledger
         )
 
+
+
+def test_durable_order_id_floor_advances_past_execution_history(
+    tmp_path: Path,
+) -> None:
+    """BTS must never reuse a durable historical broker order ID."""
+
+    ledger = ExecutionLedger(
+        tmp_path / "execution.db"
+    )
+
+    request_30 = build_trade_request(
+        intent=TradeIntent.BUY_TO_OPEN,
+        signal_id="signal-030",
+    )
+
+    ledger.reserve(
+        request_30
+    )
+    ledger.mark_submitted(
+        request_30.event_id,
+        broker_order_id=30,
+    )
+    ledger.mark_filled(
+        request_30.event_id
+    )
+
+    request_31 = build_trade_request(
+        intent=TradeIntent.SELL_TO_OPEN,
+        signal_id="signal-031",
+    )
+
+    ledger.reserve(
+        request_31
+    )
+    ledger.mark_submitted(
+        request_31.event_id,
+        broker_order_id=31,
+    )
+    ledger.mark_filled(
+        request_31.event_id
+    )
+
+    allocator = IBOrderIdAllocator()
+
+    allocator.initialize(
+        30
+    )
+
+    highest_durable_id = apply_durable_order_id_floor(
+        execution_ledger=ledger,
+        order_id_allocator=allocator,
+    )
+
+    assert highest_durable_id == 31
+    assert allocator.next_order_id == 32
+    assert allocator.allocate() == 32
+
+
+def test_durable_order_id_floor_does_not_lower_tws_next_valid_id(
+    tmp_path: Path,
+) -> None:
+    """Higher TWS nextValidId must remain the allocation floor."""
+
+    ledger = ExecutionLedger(
+        tmp_path / "execution.db"
+    )
+
+    request = build_trade_request(
+        intent=TradeIntent.BUY_TO_OPEN,
+        signal_id="signal-031",
+    )
+
+    ledger.reserve(
+        request
+    )
+    ledger.mark_submitted(
+        request.event_id,
+        broker_order_id=31,
+    )
+    ledger.mark_filled(
+        request.event_id
+    )
+
+    allocator = IBOrderIdAllocator()
+
+    allocator.initialize(
+        40
+    )
+
+    highest_durable_id = apply_durable_order_id_floor(
+        execution_ledger=ledger,
+        order_id_allocator=allocator,
+    )
+
+    assert highest_durable_id == 31
+    assert allocator.next_order_id == 40
+    assert allocator.allocate() == 40
 
 def test_validate_buy_to_open_when_flat() -> None:
     """BUY_TO_OPEN should be valid from flat."""
