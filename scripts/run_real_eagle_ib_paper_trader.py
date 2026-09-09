@@ -32,7 +32,11 @@ from pathlib import Path
 import sqlite3
 import time
 
-from app.communications.eagle_client import EagleClient
+from app.communications.eagle_client import (
+    EagleAuthenticationError,
+    EagleRateLimitError,
+    EagleClient,
+)
 from app.communications.eagle_heartbeat import EagleHeartbeat
 from app.communications.eagle_hello import EagleHello
 from app.communications.eagle_trade_adapter import (
@@ -88,6 +92,7 @@ DEFAULT_MAX_MESSAGES = 0
 ARMING_ARGUMENT = "--confirm-continuous-paper"
 RECOVERY_ARGUMENT = "--recover-reserved-exit"
 SUPPORTED_EAGLE_SYMBOL = "BTCUSDT"
+EAGLE_RECONNECT_DELAYS_SECONDS = (1.0, 2.0, 5.0, 10.0, 15.0, 30.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1096,6 +1101,123 @@ def guard_reserved_exit_resubmission(
     submit_reserved()
     return True
 
+def recover_replayed_owned_exit(
+    *,
+    app: IBApiPositionApp,
+    manager: IBConnectionManager,
+    broker_client: IBBrokerClient,
+    lifecycle_database_path: str | Path,
+    signal_id: str,
+    close_matching_lifecycle: Callable[[str], None],
+    reserve_recovery_exit: Callable[[str], None],
+    expected_local_symbol: str,
+    expected_quantity: int,
+) -> tuple[int, tuple[DurableOpenSignal, ...]]:
+    """Refresh IB and BTS state before considering a replayed owned exit.
+
+    This helper deliberately performs no broker submission.
+
+    A replayed Eagle exit may represent an obligation to flatten a position
+    BTS actually owns. Before any recovery decision is made, BTS must obtain
+    a fresh completed broker position snapshot and reload the durable lifecycle.
+
+    The caller is responsible for deciding whether the refreshed state
+    permits a recovery close, requires no broker action because IB is
+    already flat, or must fail closed because the states disagree.
+    """
+
+    refresh_position_snapshot(
+        app=app,
+        manager=manager,
+        broker_client=broker_client,
+    )
+
+    broker_position = get_mbt_position(
+        broker_client,
+        expected_local_symbol=expected_local_symbol,
+    )
+
+    open_signals = load_durable_open_signals(
+        lifecycle_database_path
+    )
+
+    if broker_position == 0:
+        if len(open_signals) != 1:
+            raise RuntimeError(
+                "REPLAYED_EXIT_BROKER_ALREADY_FLAT requires exactly one "
+                "durable BTS open signal before lifecycle reconciliation."
+            )
+
+        if open_signals[0].signal_id != signal_id:
+            recovery_state = "REPLAYED_EXIT_SIGNAL_MISMATCH"
+            print(recovery_state)
+            raise RuntimeError(
+                "REPLAYED_EXIT_SIGNAL_MISMATCH: replayed Eagle exit signal "
+                "does not match the durable BTS open signal."
+            )
+
+        recovery_state = "REPLAYED_EXIT_BROKER_ALREADY_FLAT"
+        print(recovery_state)
+
+        recovery_state = "REPLAYED_EXIT_LIFECYCLE_ONLY_RECONCILIATION"
+        print(recovery_state)
+        close_matching_lifecycle(signal_id)
+
+        open_signals = load_durable_open_signals(
+            lifecycle_database_path
+        )
+
+        if open_signals:
+            raise RuntimeError(
+                "Replay lifecycle-only reconciliation did not leave BTS flat."
+            )
+
+        return broker_position, open_signals
+
+    if broker_position not in {-expected_quantity, expected_quantity}:
+        raise RuntimeError(
+            "Replayed owned exit found broker position outside the "
+            "approved runtime quantity."
+        )
+
+    if len(open_signals) != 1:
+        raise RuntimeError(
+            "Replayed owned exit with broker exposure requires exactly "
+            "one durable BTS open signal."
+        )
+
+    if open_signals[0].signal_id != signal_id:
+        recovery_state = "REPLAYED_EXIT_SIGNAL_MISMATCH"
+        print(recovery_state)
+        raise RuntimeError(
+            "REPLAYED_EXIT_SIGNAL_MISMATCH: replayed Eagle exit signal "
+            "does not match the durable BTS open signal."
+        )
+
+    if (
+        broker_position == expected_quantity
+        and open_signals[0].state is not SignalLifecycleState.LONG_OPEN
+    ):
+        raise RuntimeError(
+            "Replayed owned exit found positive broker exposure without "
+            "matching durable LONG_OPEN lifecycle."
+        )
+
+    if (
+        broker_position == -expected_quantity
+        and open_signals[0].state is not SignalLifecycleState.SHORT_OPEN
+    ):
+        raise RuntimeError(
+            "Replayed owned exit found negative broker exposure without "
+            "matching durable SHORT_OPEN lifecycle."
+        )
+
+    recovery_state = "REPLAYED_EXIT_BROKER_EXPOSURE_REMAINS"
+    print(recovery_state)
+    reserve_recovery_exit(signal_id)
+
+    return broker_position, open_signals
+
 
 def recover_reserved_exit_for_snapshot(
     *,
@@ -1160,13 +1282,98 @@ async def run_continuous_paper_trader(
     execution_ledger = ExecutionLedger(execution_ledger_path)
 
     reserved_exit = find_reserved_exit(execution_ledger)
+    reserved_exit_pending_replay = False
 
     if reserved_exit is None:
         require_execution_state_clear(execution_ledger)
-    elif not recover_reserved_exit:
+
+    elif recover_reserved_exit:
+        # Preserve the existing explicit operator-controlled recovery path.
+        pass
+
+    elif event_store.has_processed_event(reserved_exit.event_id):
+        # This is an ordinary durable RESERVED exit whose Eagle event was
+        # already consumed. Automatic startup recovery remains prohibited.
         raise RuntimeError(
             "Continuous paper trading blocked by RESERVED exit. "
             f"Restart with {RECOVERY_ARGUMENT} only after operator review."
+        )
+
+    else:
+        # Narrow crash-recovery case:
+        #
+        # BTS durably RESERVED the closing execution but crashed before the
+        # matching Eagle exit was durably consumed. This state may reconnect
+        # to Eagle for replay reconciliation, but it is NOT broker execution
+        # authorization.
+        durable_open_signals = load_durable_open_signals(
+            lifecycle_database_path
+        )
+
+        if reserved_exit.status is not ExecutionStatus.RESERVED:
+            raise RuntimeError(
+                "Unconsumed exit recovery requires RESERVED execution status."
+            )
+
+        if reserved_exit.broker_order_id is not None:
+            raise RuntimeError(
+                "Unconsumed RESERVED exit already has a broker order ID. "
+                "Submission state is ambiguous; failing closed."
+            )
+
+        if reserved_exit.symbol != SYMBOL:
+            raise RuntimeError(
+                "Unconsumed RESERVED exit symbol does not match MBT."
+            )
+
+        if reserved_exit.quantity != execution_config.quantity:
+            raise RuntimeError(
+                "Unconsumed RESERVED exit quantity does not match "
+                "the configured MBT quantity."
+            )
+
+        if len(durable_open_signals) != 1:
+            raise RuntimeError(
+                "Unconsumed RESERVED exit requires exactly one durable "
+                "BTS open signal."
+            )
+
+        durable_open_signal = durable_open_signals[0]
+
+        if durable_open_signal.signal_id != reserved_exit.signal_id:
+            raise RuntimeError(
+                "Unconsumed RESERVED exit signal does not match the "
+                "durable BTS open signal."
+            )
+
+        if durable_open_signal.state is SignalLifecycleState.LONG_OPEN:
+            expected_exit_intent = TradeIntent.SELL_TO_CLOSE
+        elif durable_open_signal.state is SignalLifecycleState.SHORT_OPEN:
+            expected_exit_intent = TradeIntent.BUY_TO_CLOSE
+        else:
+            raise RuntimeError(
+                "Unconsumed RESERVED exit has unsupported lifecycle state."
+            )
+
+        if reserved_exit.intent is not expected_exit_intent:
+            raise RuntimeError(
+                "Unconsumed RESERVED exit intent does not match the "
+                "durable BTS position direction."
+            )
+
+        reserved_exit_pending_replay = True
+
+        print()
+        print("UNCONSUMED RESERVED EXIT - REPLAY RECONCILIATION REQUIRED")
+        print(f"Event ID:  {reserved_exit.event_id}")
+        print(f"Signal ID: {reserved_exit.signal_id}")
+        print(
+            "The closing execution was durably RESERVED before its Eagle "
+            "event was consumed."
+        )
+        print(
+            "Broker execution remains blocked until Eagle replay proves "
+            "the matching exit."
         )
 
     kill_switch = KillSwitch()
@@ -1229,6 +1436,13 @@ async def run_continuous_paper_trader(
     replay_processed = 0
     replay_complete = False
     post_replay_heartbeat_seen = False
+
+    # Reconnect-only safety state for a possible Eagle exit missed during
+    # a WebSocket gap. Normal broker execution remains blocked until replay
+    # explains the discrepancy or the runner fails closed.
+    eagle_session_is_reconnect = False
+    possible_pending_gap_exit = False
+
     heartbeats = 0
     lifecycle_events = 0
     btc_events_adapted = 0
@@ -1392,6 +1606,143 @@ async def run_continuous_paper_trader(
             "IB pending-exit recovery readiness passed: "
             f"{readiness_result.ready}"
         )
+
+        # Final completed IB position snapshot immediately before the
+        # resubmission guard. Do not rely on the earlier recovery snapshot:
+        # the operator may have manually flattened or changed exposure.
+        refresh_position_snapshot(
+            app=app,
+            manager=manager,
+            broker_client=broker_client,
+        )
+
+        final_recovery_position = get_mbt_position(
+            broker_client,
+            expected_local_symbol=execution_config.local_symbol,
+        )
+
+        # From this point onward the recovery decision must use this final
+        # broker position rather than the earlier snapshot.
+        recovery_position = final_recovery_position
+
+        if recovery_position == 0:
+            print()
+            print("RESERVED_EXIT_BROKER_ALREADY_FLAT")
+            print(
+                "IB is already flat at the final pre-submission refresh. "
+                "No recovery broker order will be submitted."
+            )
+
+            final_open_signals = load_durable_open_signals(
+                lifecycle_database_path
+            )
+
+            if len(final_open_signals) != 1:
+                raise RuntimeError(
+                    "RESERVED_EXIT_BROKER_ALREADY_FLAT requires exactly one "
+                    "durable BTS open signal before lifecycle reconciliation."
+                )
+
+            if (
+                final_open_signals[0].signal_id
+                != recovery_trade_request.signal_id
+            ):
+                raise RuntimeError(
+                    "RESERVED_EXIT_BROKER_ALREADY_FLAT signal mismatch: "
+                    "durable BTS lifecycle no longer matches the pending exit."
+                )
+
+            print("RESERVED_EXIT_LIFECYCLE_ONLY_RECONCILIATION")
+
+            recovery_lifecycle_decision = coordinator.commit_request(
+                recovery_trade_request
+            )
+
+            if not recovery_lifecycle_decision.approved:
+                raise RuntimeError(
+                    "Broker is already flat but durable lifecycle-only "
+                    "reconciliation was rejected."
+                )
+
+            approved_decisions += 1
+
+            final_open_signals = load_durable_open_signals(
+                lifecycle_database_path
+            )
+
+            if final_open_signals:
+                raise RuntimeError(
+                    "Lifecycle-only recovery did not leave BTS lifecycle flat."
+                )
+
+            # The reserved recovery close was never submitted because the
+            # operator had already flattened IB. Resolve that durable
+            # reservation through the ledger's supported RESERVED->REJECTED
+            # terminal transition so it cannot be mistaken for a pending
+            # close on a later heartbeat or restart.
+            execution_ledger.mark_rejected(
+                recovery_trade_request.event_id,
+                reason=(
+                    "Broker already flat at final recovery refresh; "
+                    "reserved recovery exit resolved without submission."
+                ),
+            )
+
+            resolved_execution_record = execution_ledger.get(
+                recovery_trade_request.event_id
+            )
+
+            if resolved_execution_record is None:
+                raise RuntimeError(
+                    "Manual-flat recovery execution record disappeared "
+                    "after terminal resolution."
+                )
+
+            if resolved_execution_record.status is ExecutionStatus.RESERVED:
+                raise RuntimeError(
+                    "Manual-flat recovery left the durable execution RESERVED."
+                )
+
+            if resolved_execution_record.status is not ExecutionStatus.REJECTED:
+                raise RuntimeError(
+                    "Manual-flat recovery execution did not reach the expected "
+                    "terminal REJECTED state."
+                )
+
+            print("RESERVED_EXIT_EXECUTION_RESOLVED_WITHOUT_SUBMISSION")
+            print(
+                "Manual broker flatten confirmed; durable BTS lifecycle "
+                "and execution obligation reconciled without another IB "
+                "close order."
+            )
+            return
+
+        # The final fresh broker snapshot must exactly match the exposure
+        # implied by the closing intent. Direction matters; matching only
+        # absolute quantity is not sufficient.
+        if recovery_trade_request.intent is TradeIntent.SELL_TO_CLOSE:
+            expected_recovery_position = execution_config.quantity
+        elif recovery_trade_request.intent is TradeIntent.BUY_TO_CLOSE:
+            expected_recovery_position = -execution_config.quantity
+        else:
+            raise RuntimeError(
+                "Reserved exit recovery has a non-closing TradeIntent."
+            )
+
+        if recovery_position != expected_recovery_position:
+            print()
+            print("RESERVED_EXIT_BROKER_POSITION_MISMATCH")
+            print(
+                "Recovery stopped before broker submission because the final "
+                "IB position does not exactly match the exposure BTS expects "
+                "for this closing intent."
+            )
+            print(f"Expected MBT position: {expected_recovery_position}")
+            print(f"Observed MBT position: {recovery_position}")
+            raise RuntimeError(
+                "Reserved exit recovery broker-position mismatch. "
+                "No lifecycle close or broker order was performed."
+            )
 
         broker_order_id = app.order_id_allocator.allocate()
 
@@ -1735,11 +2086,18 @@ async def run_continuous_paper_trader(
         print(f"Continuous trading armed:  {armed}")
         print("=" * 72)
 
-        eagle_client = EagleClient(
-            uri=EAGLE_URI,
-            api_key=api_key,
-            since_seq=event_store.get_last_seq(),
-        )
+        def build_eagle_client() -> EagleClient:
+            """Build an Eagle client from the latest durable sequence cursor."""
+
+            latest_durable_cursor = event_store.get_last_seq()
+
+            return EagleClient(
+                uri=EAGLE_URI,
+                api_key=api_key,
+                since_seq=latest_durable_cursor,
+            )
+
+        eagle_client = build_eagle_client()
 
         print()
         print("REAL EAGLE -> IB CONTINUOUS PAPER TRADER")
@@ -1760,1103 +2118,1696 @@ async def run_continuous_paper_trader(
 
         print("=" * 72)
 
-        async for message in eagle_client.listen():
-            messages_observed += 1
-            print()
-            print("-" * 72)
+        stop_requested = False
+        eagle_reconnect_attempt = 0
 
-            # Heartbeats provide a safe opportunity to restore a transient
-            # paper-TWS outage without terminating the Eagle listener. The
-            # reconnect work runs off the asyncio event loop because the IB
-            # connection manager uses synchronous waits between attempts.
-            if isinstance(message, EagleHeartbeat):
-                pending_reserved_exit = find_reserved_exit(
-                    execution_ledger
-                )
-
-                if pending_reserved_exit is not None:
-                    if not manager.ready:
-                        try:
-                            await asyncio.to_thread(
-                                recover_ib_connection,
-                                reserved_exit_event_id=(
-                                    pending_reserved_exit.event_id
-                                ),
-                            )
-                        except (
-                            ConnectionError,
-                            OSError,
-                            TimeoutError,
-                        ) as error:
-                            print()
-                            print(
-                                "IB CONNECTION LOST - RESERVED EXIT PENDING"
-                            )
-                            print(f"{type(error).__name__}: {error}")
-                            print(
-                                "The durable exit remains RESERVED. BTS will "
-                                "retry on a later Eagle heartbeat."
-                            )
-                            continue
-
-                    # Connection recovery succeeded (or IB was already ready).
-                    # Fulfillment is separate from the transport-error catch:
-                    # once a broker order is submitted, an execution timeout
-                    # must fail closed rather than masquerade as a reconnect
-                    # failure and risk a duplicate submission later.
-                    await asyncio.to_thread(
-                        recover_reserved_exit_obligation,
-                        pending_reserved_exit,
-                    )
-
-                elif not manager.ready:
-                    try:
-                        await asyncio.to_thread(
-                            recover_ib_connection
-                        )
-                    except (
-                        ConnectionError,
-                        OSError,
-                        TimeoutError,
-                    ) as error:
-                        print()
-                        print(
-                            "IB CONNECTION LOST - EAGLE LISTENER REMAINS ACTIVE"
-                        )
-                        print(f"{type(error).__name__}: {error}")
-                        print(
-                            "Broker execution remains blocked. BTS will check "
-                            "the paper TWS connection again on a later heartbeat."
-                        )
-                        continue
-
-            if isinstance(message, EagleHello):
-                hello_received = True
-                staging_confirmed = message.environment.value == "live"
-                replay_expected = message.replay_count
-                replay_processed = 0
-                replay_complete = replay_expected == 0
-                post_replay_heartbeat_seen = False
-
-                print("fund.hello received.")
-                print(f"Environment:       {message.environment.value}")
-                print(f"Replay expected:   {replay_expected}")
-                print(f"Eagle open count:  {message.open_count}")
-                print(f"Server last_seq:   {message.last_seq}")
-                print(f"Requested since:   {message.since_seq}")
-
-                if not staging_confirmed:
-                    raise RuntimeError(
-                        "Safety violation: continuous paper trader connected to "
-                        "non-LIVE Eagle environment."
-                    )
-
-                relevant_eagle_open_positions = (
-                    get_relevant_btc_eagle_open_positions(
-                        message.open_positions
-                    )
-                )
-
-                print(
-                    "Relevant BTC Eagle opens: "
-                    f"{len(relevant_eagle_open_positions)}"
-                )
-
-                missed_eagle_signal_ids = set(
-                    get_missed_eagle_signal_ids(
-                        relevant_eagle_open_positions=(
-                            relevant_eagle_open_positions
-                        ),
-                        broker_position=starting_position,
-                        open_signals=starting_open_signals,
-                    )
-                )
-
-                if missed_eagle_signal_ids:
+        while not stop_requested:
+            try:
+                async for message in eagle_client.listen():
+                    messages_observed += 1
+                    eagle_reconnect_attempt = 0
                     print()
-                    print(
-                        "EAGLE OPEN POSITION MISSED WHILE BTS WAS OFFLINE"
-                    )
-                    print(
-                        "BTS and the broker are flat. Existing Eagle "
-                        "BTC positions will NOT be chased."
-                    )
-
-                    for missed_signal_id in sorted(
-                        missed_eagle_signal_ids
-                    ):
-                        print(
-                            f"Missed Signal ID: {missed_signal_id}"
-                        )
-
-                    print(
-                        "Replay for these signal IDs will be consumed "
-                        "without creating BTS lifecycle exposure."
-                    )
-                    print(
-                        "Their eventual exits will be consumed with "
-                        "NO broker order."
-                    )
-                    print(
-                        "BTS will trade the next fresh BTC fund.entry "
-                        "normally."
-                    )
-
-                else:
-                    require_eagle_hello_reconciled(
-                        relevant_eagle_open_positions=(
-                            relevant_eagle_open_positions
-                        ),
-                        broker_position=starting_position,
-                        open_signals=starting_open_signals,
-                        expected_quantity=execution_config.quantity,
-                    )
-
-                    print(
-                        "Eagle/BTS/TWS startup reconciliation: PASSED"
-                    )
-
-            elif isinstance(message, EagleHeartbeat):
-                heartbeats += 1
-
-                # During armed operation, or before replay is complete, heartbeat
-                # sequence may safely advance durable cursor. In unarmed live
-                # observation we intentionally do not advance the cursor beyond an
-                # unconsumed live lifecycle signal.
-                if armed or not replay_complete:
-                    heartbeat_processor.process(message)
-                    durable_cursor_text = str(event_store.get_last_seq())
-                else:
-                    durable_cursor_text = (
-                        f"{event_store.get_last_seq()} (not advanced in observe mode)"
-                    )
-
-                if replay_complete:
-                    post_replay_heartbeat_seen = True
-
-                print(f"fund.heartbeat seq {message.seq}")
-                print(f"Replay complete: {replay_complete}")
-                print(f"Post-replay heartbeat: {post_replay_heartbeat_seen}")
-                print(f"Durable cursor: {durable_cursor_text}")
-
-            elif isinstance(message, EagleUpdate):
-                was_replay_update = not replay_complete
-
-                print(f"fund.update seq {message.seq}")
-                print(f"Signal ID: {message.signal_id}")
-                print(f"Update type: {message.update_type}")
-                print(f"Trail stop: {message.trail_stop}")
-                print(
-                    "Stop management not enabled; no broker action taken."
-                )
-
-                if was_replay_update:
-                    update_result = event_store.check_and_mark_event_with_seq(
-                        message.event_id,
-                        message.seq,
-                    )
-
-                    if update_result is EventProcessingResult.ACCEPTED:
-                        replay_processed, replay_complete = _record_replay_frame(
-                            replay_processed=replay_processed,
-                            replay_expected=replay_expected,
-                        )
-
-                        if replay_complete:
-                            print("Historical Eagle replay is now complete.")
-                    else:
-                        # The frame still belongs to Eagle's announced replay.
-                        # Count delivered replay frames even when BTS already knew it.
-                        replay_processed, replay_complete = _record_replay_frame(
-                            replay_processed=replay_processed,
-                            replay_expected=replay_expected,
-                        )
-
-                        print(
-                            "fund.update replay status: "
-                            f"{update_result.value}."
-                        )
-
-                        if replay_complete:
-                            print("Historical Eagle replay is now complete.")
-
-                elif armed:
-                    # In armed Version 1, updates are deliberately consumed and
-                    # durably advanced even though no broker stop action occurs.
-                    event_store.check_and_mark_event_with_seq(
-                        message.event_id,
-                        message.seq,
-                    )
-                else:
-                    print(
-                        "OBSERVE MODE - fund.update was not persisted; "
-                        "durable cursor unchanged."
-                    )
-
-            elif isinstance(message, IncomingLifecycleEvent):
-                lifecycle_events += 1
-                was_replay_event = not replay_complete
-
-                # -------------------------------------------------------------
-                # REPLAY lifecycle events are durably processed in both modes.
-                # They may rebuild lifecycle state, but can never reach IB.
-                # -------------------------------------------------------------
-                if was_replay_event:
-                    event_result = event_processor.process(message)
-
-                    print(f"Lifecycle: {message.message_type}")
-                    print(f"Seq:       {message.seq}")
-                    print(f"Signal ID: {message.signal_id}")
-                    print(f"Event status: {event_result.status.value}")
-
-                    replay_processed, replay_complete = _record_replay_frame(
-                        replay_processed=replay_processed,
-                        replay_expected=replay_expected,
-                    )
-
-                    if replay_complete:
-                        print("Historical Eagle replay is now complete.")
-
-                    if event_result.status is not EventProcessStatus.ACCEPTED:
-                        print("Duplicate/out-of-sequence replay event stopped.")
-                    elif message.signal_id in missed_eagle_signal_ids:
-                        print(
-                            "MISSED EAGLE TRADE REPLAY CONSUMED - "
-                            "no BTS lifecycle mutation and no broker order."
-                        )
-                    elif message.message_type not in {"fund.entry", "fund.exit"}:
-                        print("Lifecycle type ignored.")
-                    else:
-                        adapt_result = adapter.adapt(message)
-                        print(f"Adapter status: {adapt_result.status.value}")
-
-                        if adapt_result.status is EagleTradeAdaptStatus.IGNORED_SYMBOL:
-                            non_btc_events_ignored += 1
-                            print("Non-BTC instrument ignored.")
-                        elif (
-                            adapt_result.status
-                            is EagleTradeAdaptStatus.IGNORED_UNKNOWN_EXIT
-                        ):
-                            non_btc_events_ignored += 1
-                            print("Unknown/non-BTC exit ignored.")
-                        elif adapt_result.status is EagleTradeAdaptStatus.ADAPTED:
-                            btc_events_adapted += 1
-                            normalized_event = adapt_result.event
-                            if normalized_event is None:
-                                raise RuntimeError(
-                                    "Adapted Eagle event contained no event."
-                                )
-
-                            print(
-                                "Normalized intent: "
-                                f"{normalized_event.payload['intent']}"
-                            )
-
-                            replay_decision = coordinator.process_event(
-                                normalized_event
-                            )
-                            print(
-                                "Replay trade decision: "
-                                f"{replay_decision.reason}"
-                            )
-
-                            if replay_decision.approved:
-                                approved_decisions += 1
-                            else:
-                                rejected_decisions += 1
-
-                            print(
-                                "REPLAY HARD STOP - historical event cannot "
-                                "reach IB execution."
-                            )
-
-                # -------------------------------------------------------------
-                # LIVE lifecycle event.
-                # In unarmed mode: inspect only; do not persist or mutate.
-                # In armed mode: durable processing and execution are allowed.
-                # -------------------------------------------------------------
-                else:
-                    print(f"Lifecycle: {message.message_type}")
-                    print(f"Seq:       {message.seq}")
-                    print(f"Signal ID: {message.signal_id}")
-
-                    if not post_replay_heartbeat_seen:
-                        raise RuntimeError(
-                            "Live Eagle lifecycle arrived before required "
-                            "post-replay heartbeat."
-                        )
-
-                    if message.signal_id in missed_eagle_signal_ids:
-                        print(
-                            "MISSED EAGLE TRADE LIFECYCLE IGNORED"
-                        )
-                        print(
-                            f"Signal ID: {message.signal_id}"
-                        )
-                        print(
-                            f"Lifecycle: {message.message_type}"
-                        )
-                        print(
-                            "BTS never entered this Eagle trade; "
-                            "NO broker order will be submitted."
-                        )
-
-                        if armed:
-                            missed_event_result = (
-                                event_processor.process(
-                                    message
-                                )
-                            )
-                            print(
-                                "Event status: "
-                                f"{missed_event_result.status.value}"
-                            )
-                        else:
-                            print(
-                                "OBSERVE MODE - missed lifecycle event "
-                                "was not persisted."
-                            )
-
-                        if message.message_type == "fund.exit":
-                            missed_eagle_signal_ids.discard(
-                                message.signal_id
-                            )
-                            print(
-                                "Missed Eagle trade is now closed; "
-                                "BTS remains flat and ready for the "
-                                "next fresh BTC fund.entry."
-                            )
-
-                        continue
-
-                    # Adapter is non-executing. It lets us identify BTC intent
-                    # before deciding whether armed durable processing is allowed.
-                    adapt_result = adapter.adapt(message)
-                    print(f"Adapter status: {adapt_result.status.value}")
-
-                    if adapt_result.status is EagleTradeAdaptStatus.IGNORED_SYMBOL:
-                        non_btc_events_ignored += 1
-                        print("Non-BTC instrument ignored.")
-
-                        if armed:
-                            event_processor.process(message)
-                        else:
-                            print(
-                                "OBSERVE MODE - non-BTC lifecycle event was not "
-                                "persisted; durable cursor unchanged."
-                            )
-                        continue
-
-                    if (
-                        adapt_result.status
-                        is EagleTradeAdaptStatus.IGNORED_UNKNOWN_EXIT
-                    ):
-                        non_btc_events_ignored += 1
-                        print("Unknown/non-BTC exit ignored.")
-
-                        if armed:
-                            event_processor.process(message)
-                        else:
-                            print(
-                                "OBSERVE MODE - unknown exit was not persisted; "
-                                "durable cursor unchanged."
-                            )
-                        continue
-
-                    if adapt_result.status is not EagleTradeAdaptStatus.ADAPTED:
-                        raise RuntimeError(
-                            f"Unsupported EagleTradeAdaptStatus: "
-                            f"{adapt_result.status!r}."
-                        )
-
-                    btc_events_adapted += 1
-                    normalized_event = adapt_result.event
-                    if normalized_event is None:
-                        raise RuntimeError("Adapted Eagle event contained no event.")
-
-                    print(
-                        "Normalized intent: "
-                        f"{normalized_event.payload['intent']}"
-                    )
-
-                    intended_intent = TradeIntent(
-                        normalized_event.payload["intent"]
-                    )
-
-                    is_closing_intent = intended_intent in {
-                        TradeIntent.SELL_TO_CLOSE,
-                        TradeIntent.BUY_TO_CLOSE,
-                    }
-
-                    # ---------------------------------------------------------
-                    # EXIT-OBLIGATION DURABILITY BOUNDARY
-                    # ---------------------------------------------------------
-                    if armed and is_closing_intent:
-                        require_execution_state_clear(
+                    print("-" * 72)
+        
+                    # Heartbeats provide a safe opportunity to restore a transient
+                    # paper-TWS outage without terminating the Eagle listener. The
+                    # reconnect work runs off the asyncio event loop because the IB
+                    # connection manager uses synchronous waits between attempts.
+                    if isinstance(message, EagleHeartbeat):
+                        pending_reserved_exit = find_reserved_exit(
                             execution_ledger
                         )
 
-                        event_result = event_processor.process(
-                            message
-                        )
-                        print(f"Event status: {event_result.status.value}")
-
-                        if event_result.status is not EventProcessStatus.ACCEPTED:
-                            print(
-                                "Duplicate/out-of-sequence live exit stopped "
-                                "before execution reservation."
-                            )
-                            continue
-
-                        prepared_decision = coordinator.prepare_event(
-                            normalized_event
-                        )
-
-                        print(
-                            "Trade preparation approved: "
-                            f"{prepared_decision.approved}"
-                        )
-                        print(
-                            "Trade preparation reason:   "
-                            f"{prepared_decision.reason}"
-                        )
-
-                        if not prepared_decision.approved:
-                            rejected_decisions += 1
-                            print(
-                                "Trade preparation rejected; "
-                                "durable lifecycle was NOT mutated."
-                            )
-                            continue
-
-                        trade_request = prepared_decision.trade_request
-
-                        if trade_request is None:
-                            raise RuntimeError(
-                                "Approved prepared decision had no TradeRequest."
-                            )
-
-                        execution_client.reserve_execution(
-                            trade_request
-                        )
-
-                        print(
-                            "Exit execution obligation durably RESERVED "
-                            "before broker refresh."
-                        )
-                        print("Broker order has NOT been submitted.")
-
-                        if not manager.ready:
-                            try:
-                                await asyncio.to_thread(
-                                    recover_ib_connection,
-                                    reserved_exit_event_id=trade_request.event_id,
-                                )
-                            except (
-                                ConnectionError,
-                                OSError,
-                                TimeoutError,
-                            ) as error:
-                                rejected_decisions += 1
-
+                        if not replay_complete:
+                            if pending_reserved_exit is not None:
                                 print()
                                 print(
-                                    "IB CONNECTION LOST - RESERVED EXIT PENDING"
-                                )
-                                print(f"{type(error).__name__}: {error}")
-                                print(
-                                    "The durable exit obligation remains "
-                                    "RESERVED. No broker order was submitted."
+                                    "REPLAYED EXIT RECOVERY WAITING FOR REPLAY COMPLETION"
                                 )
                                 print(
-                                    "Eagle listener remains active; BTS will "
-                                    "not convert this exit into a missed entry."
+                                    "The durable exit remains RESERVED. Historical "
+                                    "replay cannot submit a broker order."
                                 )
-                                continue
 
-                        refresh_position_snapshot(
-                            app=app,
-                            manager=manager,
-                            broker_client=broker_client,
-                        )
+                            if not manager.ready:
+                                try:
+                                    await asyncio.to_thread(
+                                        recover_ib_connection
+                                    )
+                                except (
+                                    ConnectionError,
+                                    OSError,
+                                    TimeoutError,
+                                ) as error:
+                                    print()
+                                    print(
+                                        "IB CONNECTION LOST - EAGLE LISTENER REMAINS ACTIVE"
+                                    )
+                                    print(f"{type(error).__name__}: {error}")
+                                    print(
+                                        "Broker execution remains blocked. BTS will check "
+                                        "the paper TWS connection again on a later heartbeat."
+                                    )
+                                    continue
 
-                        broker_position, open_signals = (
-                            reconcile_broker_and_lifecycle(
-                                broker_client=broker_client,
-                                lifecycle_database_path=lifecycle_database_path,
-                                expected_local_symbol=execution_config.local_symbol,
-                                expected_quantity=execution_config.quantity,
-                            )
-                        )
+                        else:
+                            # The current message is a fresh heartbeat after Eagle's
+                            # announced replay has completed.
+                            post_replay_heartbeat_seen = True
 
-                        validate_trade_request_against_position(
-                            trade_request=trade_request,
-                            broker_position=broker_position,
-                            open_signals=open_signals,
-                            expected_quantity=execution_config.quantity,
-                        )
-
-                        risk_decision = risk_manager.evaluate(
-                            trade_request,
-                            current_position=broker_position,
-                        )
-
-                        print(f"Risk approved: {risk_decision.approved}")
-                        print(
-                            "Projected position: "
-                            f"{risk_decision.projected_position}"
-                        )
-
-                        if not risk_decision.approved:
-                            rejected_decisions += 1
-                            raise RuntimeError(
-                                "RiskManager rejected RESERVED live Eagle close "
-                                "TradeRequest BEFORE durable lifecycle mutation: "
-                                f"{risk_decision.reason}"
-                            )
-
-                        expected_position = expected_position_after_trade(
-                            trade_request
-                        )
-
-                        if risk_decision.projected_position != expected_position:
-                            raise RuntimeError(
-                                "Risk projected position does not match "
-                                "expected trade result."
-                            )
-
-                        readiness = IBTradingReadiness(
-                            api_ready=app.api_ready,
-                            order_id_allocator=app.order_id_allocator,
-                            broker_client=broker_client,
-                            trading_controls=trading_controls,
-                            kill_switch=kill_switch,
-                        )
-
-                        readiness_result = readiness.require_ready(
-                            positions_reconciled=True,
-                            execution_state_clear=True,
-                        )
-
-                        print(f"IB readiness passed: {readiness_result.ready}")
-
-                        broker_order_id = app.order_id_allocator.allocate()
-
-                        print()
-                        print("=" * 72)
-                        print("LIVE PAPER ORDER AUTHORIZED")
-                        print("=" * 72)
-                        print(f"Eagle event: {trade_request.event_id}")
-                        print(f"Signal ID:   {trade_request.signal_id}")
-                        print(f"Intent:      {trade_request.intent.value}")
-                        print(f"Quantity:    {execution_config.quantity} MBT")
-                        print(f"IB order ID: {broker_order_id}")
-                        print("=" * 72)
-
-                        submission = execution_client.submit_reserved(
-                            trade_request,
-                            contract_month=execution_config.contract_month,
-                            broker_order_id=broker_order_id,
-                        )
-                        broker_submissions += 1
-
-                        expected_action = expected_ib_action(trade_request)
-                        if submission.package.order.action != expected_action:
-                            raise RuntimeError(
-                                "IB order action does not match TradeRequest."
-                            )
-
-                        if (
-                            submission.package.order.totalQuantity
-                            != execution_config.quantity
-                        ):
-                            raise RuntimeError(
-                                "IB order quantity does not match approved runtime quantity."
-                            )
-
-                        final_record = wait_for_execution_resolution(
-                            execution_ledger=execution_ledger,
-                            event_id=trade_request.event_id,
-                            kill_switch=kill_switch,
-                            timeout_seconds=EXECUTION_TIMEOUT_SECONDS,
-                        )
-
-                        if final_record.status is not ExecutionStatus.FILLED:
-                            raise RuntimeError(
-                                "Paper order did not reach FILLED. "
-                                f"Status: {final_record.status.value}. "
-                                f"Reason: {final_record.reason}"
-                            )
-
-                        filled_orders += 1
-
-                        # Broker has confirmed the close FILLED.
-                        # Only now may BTS commit the durable lifecycle close.
-                        decision = coordinator.commit_request(
-                            trade_request
-                        )
-
-                        print(f"Trade decision approved: {decision.approved}")
-                        print(f"Trade decision reason:   {decision.reason}")
-
-                        if not decision.approved:
-                            raise RuntimeError(
-                                "Broker close FILLED but durable lifecycle "
-                                "commit was rejected."
-                            )
-
-                        approved_decisions += 1
-
-                        committed_trade_request = decision.trade_request
-
-                        if committed_trade_request is None:
-                            raise RuntimeError(
-                                "Approved lifecycle commit had no TradeRequest."
-                            )
-
-                        if committed_trade_request != trade_request:
-                            raise RuntimeError(
-                                "Committed TradeRequest does not match "
-                                "the filled TradeRequest."
-                            )
-
-                        post_decision_open_signals = load_durable_open_signals(
-                            lifecycle_database_path
-                        )
-
-                        if post_decision_open_signals:
-                            raise RuntimeError(
-                                "Filled close did not leave durable lifecycle flat."
-                            )
-
-                        refresh_position_snapshot(
-                            app=app,
-                            manager=manager,
-                            broker_client=broker_client,
-                        )
-
-                        reconciled_position, reconciled_open_signals = (
-                            reconcile_broker_and_lifecycle(
-                                broker_client=broker_client,
-                                lifecycle_database_path=lifecycle_database_path,
-                                expected_local_symbol=execution_config.local_symbol,
-                                expected_quantity=execution_config.quantity,
-                            )
-                        )
-
-                        if reconciled_position != expected_position:
-                            raise RuntimeError(
-                                "Post-fill broker position does not match "
-                                "expected position."
-                            )
-
-                        print()
-                        print("PAPER ORDER FILLED AND RECONCILED.")
-                        print(f"Current MBT position: {reconciled_position}")
-                        print(
-                            "Durable open signals: "
-                            f"{len(reconciled_open_signals)}"
-                        )
-
-                        continue
-
-                    # ---------------------------------------------------------
-                    # FRESH ENTRY IB-RECOVERY BOUNDARY
-                    # ---------------------------------------------------------
-                    # A stale local connection flag must not cause BTS to miss
-                    # an otherwise valid fresh Eagle entry. Before the normal
-                    # broker snapshot/readiness path, make a fresh paper-TWS
-                    # recovery attempt. If TWS is still unavailable after the
-                    # bounded recovery cycle, consume this entry as missed so
-                    # BTS will never chase it after reconnect.
-                    if (
-                        armed
-                        and intended_intent
-                        in {
-                            TradeIntent.BUY_TO_OPEN,
-                            TradeIntent.SELL_TO_OPEN,
-                        }
-                        and not manager.ready
-                    ):
-                        try:
-                            await asyncio.to_thread(
-                                recover_ib_connection
-                            )
-                        except (
-                            ConnectionError,
-                            OSError,
-                            TimeoutError,
-                        ) as error:
-                            event_result = event_processor.process(
-                                message
-                            )
-                            print(
-                                f"Event status: {event_result.status.value}"
-                            )
-
+                            # A RESERVED exit inherited from a prior crashed process
+                            # is not authorized merely because replay has completed.
+                            # The matching replayed Eagle exit must first prove the
+                            # obligation and clear reserved_exit_pending_replay.
                             if (
-                                event_result.status
-                                is not EventProcessStatus.ACCEPTED
+                                pending_reserved_exit is not None
+                                and reserved_exit_pending_replay
                             ):
-                                print(
-                                    "Duplicate/out-of-sequence live entry "
-                                    "stopped before missed-entry handling."
+                                raise RuntimeError(
+                                    "UNCONSUMED RESERVED EXIT remained unresolved after "
+                                    "Eagle replay. Broker execution remains blocked; "
+                                    "the matching replayed Eagle exit was not proven."
                                 )
-                                continue
 
-                            missed_eagle_signal_ids.add(
-                                message.signal_id
+                            if pending_reserved_exit is not None:
+                                if not manager.ready:
+                                    try:
+                                        await asyncio.to_thread(
+                                            recover_ib_connection,
+                                            reserved_exit_event_id=(
+                                                pending_reserved_exit.event_id
+                                            ),
+                                        )
+                                    except (
+                                        ConnectionError,
+                                        OSError,
+                                        TimeoutError,
+                                    ) as error:
+                                        print()
+                                        print(
+                                            "IB CONNECTION LOST - RESERVED EXIT PENDING"
+                                        )
+                                        print(f"{type(error).__name__}: {error}")
+                                        print(
+                                            "The durable exit remains RESERVED. BTS will "
+                                            "retry on a later Eagle heartbeat."
+                                        )
+                                        continue
+
+                                # Connection recovery succeeded (or IB was already ready).
+                                # Fulfillment still passes through the normal fresh-IB,
+                                # durable-state, and ambiguous-submission guards.
+                                await asyncio.to_thread(
+                                    recover_reserved_exit_obligation,
+                                    pending_reserved_exit,
+                                )
+
+                            elif not manager.ready:
+                                try:
+                                    await asyncio.to_thread(
+                                        recover_ib_connection
+                                    )
+                                except (
+                                    ConnectionError,
+                                    OSError,
+                                    TimeoutError,
+                                ) as error:
+                                    print()
+                                    print(
+                                        "IB CONNECTION LOST - EAGLE LISTENER REMAINS ACTIVE"
+                                    )
+                                    print(f"{type(error).__name__}: {error}")
+                                    print(
+                                        "Broker execution remains blocked. BTS will check "
+                                        "the paper TWS connection again on a later heartbeat."
+                                    )
+                                    continue
+
+                    if isinstance(message, EagleHello):
+                        hello_received = True
+                        staging_confirmed = message.environment.value == "live"
+                        replay_expected = message.replay_count
+                        replay_processed = 0
+                        replay_complete = replay_expected == 0
+                        post_replay_heartbeat_seen = False
+        
+                        print("fund.hello received.")
+                        print(f"Environment:       {message.environment.value}")
+                        print(f"Replay expected:   {replay_expected}")
+                        print(f"Eagle open count:  {message.open_count}")
+                        print(f"Server last_seq:   {message.last_seq}")
+                        print(f"Requested since:   {message.since_seq}")
+        
+                        if not staging_confirmed:
+                            raise RuntimeError(
+                                "Safety violation: continuous paper trader connected to "
+                                "non-LIVE Eagle environment."
                             )
-                            rejected_decisions += 1
+        
+                        relevant_eagle_open_positions = (
+                            get_relevant_btc_eagle_open_positions(
+                                message.open_positions
+                            )
+                        )
 
+                        # Every Eagle session, including reconnects, must
+                        # reconcile against fresh broker and durable lifecycle
+                        # state rather than process-start snapshots.
+                        if not manager.ready:
+                            await asyncio.to_thread(recover_ib_connection)
+
+                        await asyncio.to_thread(
+                            refresh_position_snapshot,
+                            app=app,
+                            manager=manager,
+                            broker_client=broker_client,
+                        )
+
+                        hello_broker_position, hello_open_signals = (
+                            reconcile_broker_and_lifecycle(
+                                broker_client=broker_client,
+                                lifecycle_database_path=lifecycle_database_path,
+                                expected_local_symbol=execution_config.local_symbol,
+                                expected_quantity=execution_config.quantity,
+                            )
+                        )
+
+                        print(
+                            "Relevant BTC Eagle opens: "
+                            f"{len(relevant_eagle_open_positions)}"
+                        )
+
+                        expected_gap_position: int | None = None
+
+                        if len(hello_open_signals) == 1:
+                            if (
+                                hello_open_signals[0].state
+                                is SignalLifecycleState.LONG_OPEN
+                            ):
+                                expected_gap_position = execution_config.quantity
+                            elif (
+                                hello_open_signals[0].state
+                                is SignalLifecycleState.SHORT_OPEN
+                            ):
+                                expected_gap_position = -execution_config.quantity
+
+                        possible_pending_gap_exit = (
+                            eagle_session_is_reconnect
+                            and len(relevant_eagle_open_positions) == 0
+                            and len(hello_open_signals) == 1
+                            and expected_gap_position is not None
+                            and hello_broker_position == expected_gap_position
+                        )
+
+                        missed_eagle_signal_ids = set(
+                            get_missed_eagle_signal_ids(
+                                relevant_eagle_open_positions=(
+                                    relevant_eagle_open_positions
+                                ),
+                                broker_position=hello_broker_position,
+                                open_signals=hello_open_signals,
+                            )
+                        )
+        
+                        if missed_eagle_signal_ids:
                             print()
                             print(
-                                "IB CONNECTION LOST - ENTRY MARKED MISSED"
-                            )
-                            print(f"{type(error).__name__}: {error}")
-                            print(
-                                "BTS did not enter this Eagle trade and will "
-                                "not chase it after the paper TWS connection "
-                                "returns."
+                                "EAGLE OPEN POSITION MISSED WHILE BTS WAS OFFLINE"
                             )
                             print(
-                                "Eagle listener remains active; the matching "
-                                "exit will be consumed without a broker order."
+                                "BTS and the broker are flat. Existing Eagle "
+                                "BTC positions will NOT be chased."
                             )
-                            continue
+        
+                            for missed_signal_id in sorted(
+                                missed_eagle_signal_ids
+                            ):
+                                print(
+                                    f"Missed Signal ID: {missed_signal_id}"
+                                )
+        
+                            print(
+                                "Replay for these signal IDs will be consumed "
+                                "without creating BTS lifecycle exposure."
+                            )
+                            print(
+                                "Their eventual exits will be consumed with "
+                                "NO broker order."
+                            )
+                            print(
+                                "BTS will trade the next fresh BTC fund.entry "
+                                "normally."
+                            )
+        
+                        elif possible_pending_gap_exit:
+                            print()
+                            print("POSSIBLE_PENDING_GAP_EXIT")
+                            print(
+                                "Eagle is flat, while BTS and IB still agree "
+                                "on exactly one BTS-owned MBT position."
+                            )
+                            print(
+                                "This reconnect may be missing the matching "
+                                "Eagle exit. Broker execution remains blocked "
+                                "while replay is inspected."
+                            )
+                            print(
+                                f"Signal ID: {hello_open_signals[0].signal_id}"
+                            )
+                            print(
+                                f"Broker position: {hello_broker_position}"
+                            )
 
-                    refresh_position_snapshot(
-                        app=app,
-                        manager=manager,
-                        broker_client=broker_client,
-                    )
+                        else:
+                            require_eagle_hello_reconciled(
+                                relevant_eagle_open_positions=(
+                                    relevant_eagle_open_positions
+                                ),
+                                broker_position=hello_broker_position,
+                                open_signals=hello_open_signals,
+                                expected_quantity=execution_config.quantity,
+                            )
+        
+                            print(
+                                "Eagle/BTS/TWS startup reconciliation: PASSED"
+                            )
+        
+                        eagle_session_is_reconnect = False
 
-                    broker_position, open_signals = reconcile_broker_and_lifecycle(
-                        broker_client=broker_client,
-                        lifecycle_database_path=lifecycle_database_path,
-                        expected_local_symbol=execution_config.local_symbol,
-                        expected_quantity=execution_config.quantity,
-                    )
+                    elif isinstance(message, EagleHeartbeat):
+                        heartbeats += 1
 
-                    require_execution_state_clear(execution_ledger)
+                        if possible_pending_gap_exit and replay_complete:
+                            raise RuntimeError(
+                                "POSSIBLE_PENDING_GAP_EXIT remained unresolved "
+                                "after Eagle replay. Broker execution remains "
+                                "blocked; no matching replayed exit proved the "
+                                "BTS-owned broker position should be closed."
+                            )
 
-                    if intended_intent in {
-                        TradeIntent.BUY_TO_OPEN,
-                        TradeIntent.SELL_TO_OPEN,
-                    }:
-                        if broker_position != 0 or open_signals:
-                            if armed:
+        
+                        # During armed operation, or before replay is complete, heartbeat
+                        # sequence may safely advance durable cursor. In unarmed live
+                        # observation we intentionally do not advance the cursor beyond an
+                        # unconsumed live lifecycle signal.
+                        if armed or not replay_complete:
+                            heartbeat_processor.process(message)
+                            durable_cursor_text = str(event_store.get_last_seq())
+                        else:
+                            durable_cursor_text = (
+                                f"{event_store.get_last_seq()} (not advanced in observe mode)"
+                            )
+        
+                        if replay_complete:
+                            post_replay_heartbeat_seen = True
+        
+                        print(f"fund.heartbeat seq {message.seq}")
+                        print(f"Replay complete: {replay_complete}")
+                        print(f"Post-replay heartbeat: {post_replay_heartbeat_seen}")
+                        print(f"Durable cursor: {durable_cursor_text}")
+        
+                    elif isinstance(message, EagleUpdate):
+                        was_replay_update = not replay_complete
+        
+                        print(f"fund.update seq {message.seq}")
+                        print(f"Signal ID: {message.signal_id}")
+                        print(f"Update type: {message.update_type}")
+                        print(f"Trail stop: {message.trail_stop}")
+                        print(
+                            "Stop management not enabled; no broker action taken."
+                        )
+        
+                        if was_replay_update:
+                            update_result = event_store.check_and_mark_event_with_seq(
+                                message.event_id,
+                                message.seq,
+                            )
+        
+                            if update_result is EventProcessingResult.ACCEPTED:
+                                replay_processed, replay_complete = _record_replay_frame(
+                                    replay_processed=replay_processed,
+                                    replay_expected=replay_expected,
+                                )
+        
+                                if replay_complete:
+                                    print("Historical Eagle replay is now complete.")
+                            else:
+                                # The frame still belongs to Eagle's announced replay.
+                                # Count delivered replay frames even when BTS already knew it.
+                                replay_processed, replay_complete = _record_replay_frame(
+                                    replay_processed=replay_processed,
+                                    replay_expected=replay_expected,
+                                )
+        
+                                print(
+                                    "fund.update replay status: "
+                                    f"{update_result.value}."
+                                )
+        
+                                if replay_complete:
+                                    print("Historical Eagle replay is now complete.")
+        
+                        elif armed:
+                            # In armed Version 1, updates are deliberately consumed and
+                            # durably advanced even though no broker stop action occurs.
+                            event_store.check_and_mark_event_with_seq(
+                                message.event_id,
+                                message.seq,
+                            )
+                        else:
+                            print(
+                                "OBSERVE MODE - fund.update was not persisted; "
+                                "durable cursor unchanged."
+                            )
+        
+                    elif isinstance(message, IncomingLifecycleEvent):
+                        lifecycle_events += 1
+                        was_replay_event = not replay_complete
+        
+                        # -------------------------------------------------------------
+                        # REPLAY lifecycle events are durably processed in both modes.
+                        # They may rebuild lifecycle state, but can never reach IB.
+                        # -------------------------------------------------------------
+                        if was_replay_event:
+                            # Read-only eligibility check first.  A replayed owned
+                            # EXIT must not advance the durable Eagle cursor until
+                            # its recovery obligation (or exact broker-flat
+                            # reconciliation) is durable.
+                            replay_eligibility = event_store.check_event_with_seq(
+                                message.event_id,
+                                message.seq,
+                            )
+
+                            event_result = None
+                            if (
+                                message.message_type != "fund.exit"
+                                and replay_eligibility
+                                is EventProcessingResult.ACCEPTED
+                            ):
                                 event_result = event_processor.process(message)
-                                print(f"Event status: {event_result.status.value}")
-
                                 if (
                                     event_result.status
                                     is not EventProcessStatus.ACCEPTED
                                 ):
+                                    raise RuntimeError(
+                                        "Replay event eligibility changed between "
+                                        "read-only validation and durable consume."
+                                    )
+        
+                            print(f"Lifecycle: {message.message_type}")
+                            print(f"Seq:       {message.seq}")
+                            print(f"Signal ID: {message.signal_id}")
+                            print(f"Event status: {replay_eligibility.value}")
+        
+                            replay_processed, replay_complete = _record_replay_frame(
+                                replay_processed=replay_processed,
+                                replay_expected=replay_expected,
+                            )
+        
+                            if replay_complete:
+                                print("Historical Eagle replay is now complete.")
+        
+                            if (
+                                replay_eligibility
+                                is not EventProcessingResult.ACCEPTED
+                            ):
+                                print("Duplicate/out-of-sequence replay event stopped.")
+
+                            elif message.signal_id in missed_eagle_signal_ids:
+                                print(
+                                    "MISSED EAGLE TRADE REPLAY CONSUMED - "
+                                    "no BTS lifecycle mutation and no broker order."
+                                )
+
+                            elif message.message_type == "fund.exit":
+                                # If startup inherited a RESERVED exit whose Eagle
+                                # event was not yet consumed, only that exact replayed
+                                # EXIT may prove the obligation. A different EXIT must
+                                # never clear or bypass the replay-reconciliation gate.
+                                if reserved_exit_pending_replay:
+                                    if reserved_exit is None:
+                                        raise RuntimeError(
+                                            "Replay-reconciliation state lost its "
+                                            "startup RESERVED exit."
+                                        )
+                                    if message.event_id != reserved_exit.event_id:
+                                        raise RuntimeError(
+                                            "UNCONSUMED RESERVED EXIT replay mismatch: "
+                                            "Eagle replayed a different exit event."
+                                        )
+                                    if message.signal_id != reserved_exit.signal_id:
+                                        raise RuntimeError(
+                                            "UNCONSUMED RESERVED EXIT replay mismatch: "
+                                            "Eagle replayed a different signal."
+                                        )
+
+                                replay_recovery_request_holder: list[TradeRequest] = []
+
+                                # A previous process may have durably RESERVED this
+                                # replayed exit and then crashed before consuming the
+                                # Eagle event/cursor. Inspect that exact event first so
+                                # replay reuses the obligation instead of reserving it
+                                # a second time.
+                                existing_reserved = execution_ledger.get(
+                                    message.event_id
+                                )
+
+                                if (
+                                    existing_reserved is not None
+                                    and existing_reserved.status
+                                    is not ExecutionStatus.RESERVED
+                                ):
+                                    raise RuntimeError(
+                                        "Replayed owned exit already exists in the "
+                                        "execution ledger but is not RESERVED; "
+                                        "automatic replay recovery is ambiguous."
+                                    )
+
+                                # A prior process may have completed the
+                                # broker-flat lifecycle-only reconciliation and
+                                # then crashed before the Eagle event/cursor was
+                                # durably consumed.  Recognize that state only
+                                # when this exact replay EXIT is the durable
+                                # lifecycle's closing event.
+                                snapshot = lifecycle_guard.get_snapshot(
+                                    message.signal_id
+                                )
+                                replay_exit_already_reconciled = (
+                                    snapshot is not None
+                                    and snapshot.state
+                                    is SignalLifecycleState.CLOSED
+                                    and snapshot.last_event_id
+                                    == message.event_id
+                                )
+
+                                if replay_exit_already_reconciled:
+                                    if existing_reserved is not None:
+                                        raise RuntimeError(
+                                            "Exact replay EXIT already closed the "
+                                            "lifecycle but also has a RESERVED "
+                                            "execution; automatic recovery is "
+                                            "ambiguous."
+                                        )
+
+                                    # Lifecycle evidence alone is not enough.
+                                    # Refresh IB now and require the real broker
+                                    # position to be flat before treating the
+                                    # replay as an idempotent continuation.
+                                    refresh_position_snapshot(
+                                        app=app,
+                                        manager=manager,
+                                        broker_client=broker_client,
+                                    )
+                                    already_flat_position = get_mbt_position(
+                                        broker_client,
+                                        expected_local_symbol=(
+                                            execution_config.local_symbol
+                                        ),
+                                    )
+
+                                    if already_flat_position != 0:
+                                        raise RuntimeError(
+                                            "REPLAYED_EXIT_LIFECYCLE_ALREADY_FLAT "
+                                            "proof conflicts with live IB exposure; "
+                                            "failing closed."
+                                        )
+
+                                    replay_broker_position = (
+                                        already_flat_position
+                                    )
+                                    replay_open_signals = (
+                                        load_durable_open_signals(
+                                            lifecycle_database_path
+                                        )
+                                    )
+                                    if replay_open_signals:
+                                        raise RuntimeError(
+                                            "REPLAYED_EXIT_LIFECYCLE_ALREADY_FLAT "
+                                            "found another durable open signal; "
+                                            "failing closed."
+                                        )
+
                                     print(
-                                        "Duplicate/out-of-sequence live event "
-                                        "stopped before second-entry skip handling."
+                                        "REPLAYED_EXIT_LIFECYCLE_ALREADY_FLAT"
+                                    )
+
+                                def reserve_replayed_recovery_exit(
+                                    candidate_signal_id: str,
+                                ) -> None:
+                                    if candidate_signal_id != message.signal_id:
+                                        raise RuntimeError(
+                                            "Replay recovery obligation signal ID "
+                                            "changed before reservation."
+                                        )
+
+                                    if existing_reserved is not None:
+                                        if existing_reserved.signal_id != candidate_signal_id:
+                                            raise RuntimeError(
+                                                "Existing RESERVED replay exit signal "
+                                                "does not match the Eagle replay."
+                                            )
+
+                                        if existing_reserved.symbol != SYMBOL:
+                                            raise RuntimeError(
+                                                "Existing RESERVED replay exit is not MBT."
+                                            )
+
+                                        if (
+                                            existing_reserved.quantity
+                                            != execution_config.quantity
+                                        ):
+                                            raise RuntimeError(
+                                                "Existing RESERVED replay exit quantity "
+                                                "does not match runtime configuration."
+                                            )
+
+                                        existing_intent = TradeIntent(
+                                            existing_reserved.intent
+                                        )
+                                        if existing_intent not in {
+                                            TradeIntent.SELL_TO_CLOSE,
+                                            TradeIntent.BUY_TO_CLOSE,
+                                        }:
+                                            raise RuntimeError(
+                                                "Existing RESERVED replay execution "
+                                                "is not a closing obligation."
+                                            )
+
+                                        existing_trade_request = (
+                                            execution_ledger.get_trade_request(
+                                                message.event_id
+                                            )
+                                        )
+                                        if existing_trade_request is None:
+                                            raise RuntimeError(
+                                                "Existing RESERVED replay exit has no "
+                                                "recoverable TradeRequest."
+                                            )
+
+                                        replay_recovery_request_holder.append(
+                                            existing_trade_request
+                                        )
+                                        print(
+                                            "REPLAYED_EXIT_REUSING_RESERVED_OBLIGATION"
+                                        )
+                                        return
+
+                                    replay_adapt_result = adapter.adapt(message)
+
+                                    if (
+                                        replay_adapt_result.status
+                                        is not EagleTradeAdaptStatus.ADAPTED
+                                    ):
+                                        raise RuntimeError(
+                                            "Matching replayed Eagle exit could not "
+                                            "be adapted for recovery reservation."
+                                        )
+
+                                    replay_normalized_event = replay_adapt_result.event
+
+                                    if replay_normalized_event is None:
+                                        raise RuntimeError(
+                                            "Matching replayed Eagle exit adaptation "
+                                            "contained no normalized event."
+                                        )
+
+                                    replay_decision = coordinator.prepare_event(
+                                        replay_normalized_event
+                                    )
+
+                                    if not replay_decision.approved:
+                                        raise RuntimeError(
+                                            "Matching replayed Eagle exit could not "
+                                            "be prepared for recovery reservation."
+                                        )
+
+                                    replay_trade_request = replay_decision.trade_request
+
+                                    if replay_trade_request is None:
+                                        raise RuntimeError(
+                                            "Prepared replayed Eagle exit contained "
+                                            "no TradeRequest."
+                                        )
+
+                                    execution_client.reserve_execution(
+                                        replay_trade_request
+                                    )
+                                    replay_recovery_request_holder.append(
+                                        replay_trade_request
+                                    )
+
+                                def close_replayed_matching_lifecycle(
+                                    candidate_signal_id: str,
+                                ) -> None:
+                                    if candidate_signal_id != message.signal_id:
+                                        raise RuntimeError(
+                                            "Replay lifecycle-only reconciliation "
+                                            "signal ID changed before commit."
+                                        )
+
+                                    replay_adapt_result = adapter.adapt(message)
+
+                                    if (
+                                        replay_adapt_result.status
+                                        is not EagleTradeAdaptStatus.ADAPTED
+                                    ):
+                                        raise RuntimeError(
+                                            "Matching replayed Eagle exit could not "
+                                            "be adapted for lifecycle reconciliation."
+                                        )
+
+                                    replay_normalized_event = replay_adapt_result.event
+
+                                    if replay_normalized_event is None:
+                                        raise RuntimeError(
+                                            "Matching replayed Eagle exit adaptation "
+                                            "contained no normalized event."
+                                        )
+
+                                    replay_lifecycle_decision = (
+                                        coordinator.process_event(
+                                            replay_normalized_event
+                                        )
+                                    )
+
+                                    if not replay_lifecycle_decision.approved:
+                                        raise RuntimeError(
+                                            "Matching replayed Eagle exit could not "
+                                            "close the durable BTS lifecycle."
+                                        )
+
+                                if not replay_exit_already_reconciled:
+                                    replay_broker_position, replay_open_signals = (
+                                        recover_replayed_owned_exit(
+                                            app=app,
+                                            manager=manager,
+                                            broker_client=broker_client,
+                                            lifecycle_database_path=lifecycle_database_path,
+                                            signal_id=message.signal_id,
+                                            close_matching_lifecycle=(
+                                                close_replayed_matching_lifecycle
+                                            ),
+                                            reserve_recovery_exit=(
+                                                reserve_replayed_recovery_exit
+                                            ),
+                                            expected_local_symbol=execution_config.local_symbol,
+                                            expected_quantity=execution_config.quantity,
+                                        )
+                                    )
+                                # Recovery state is now durable.  Only now may
+                                # this Eagle EXIT be durably consumed and the
+                                # sequence cursor advanced.
+                                event_result = event_processor.process(message)
+                                if (
+                                    event_result.status
+                                    is not EventProcessStatus.ACCEPTED
+                                ):
+                                    raise RuntimeError(
+                                        "Replayed owned EXIT changed eligibility "
+                                        "before durable event consumption; failing "
+                                        "closed with recovery state preserved."
+                                    )
+
+                                print()
+                                print("REPLAYED EAGLE EXIT - RECOVERY STATE INSPECTION")
+                                print(f"Signal ID:       {message.signal_id}")
+                                print(f"Broker position: {replay_broker_position}")
+                                print(
+                                    "Durable opens:   "
+                                    f"{len(replay_open_signals)}"
+                                )
+                                print(
+                                    "NO broker recovery order submitted at this stage."
+                                )
+
+                                if reserved_exit_pending_replay:
+                                    if reserved_exit is None:
+                                        raise RuntimeError(
+                                            "Replay-reconciliation state lost its "
+                                            "startup RESERVED exit after event consume."
+                                        )
+                                    if (
+                                        message.event_id != reserved_exit.event_id
+                                        or message.signal_id != reserved_exit.signal_id
+                                    ):
+                                        raise RuntimeError(
+                                            "UNCONSUMED RESERVED EXIT proof changed "
+                                            "before replay gate clearance."
+                                        )
+
+                                    reserved_exit_pending_replay = False
+                                    print(
+                                        "UNCONSUMED RESERVED EXIT PROVED BY MATCHING REPLAY."
+                                    )
+
+                                if possible_pending_gap_exit:
+                                    possible_pending_gap_exit = False
+                                    print(
+                                        "PENDING GAP EXIT EXPLAINED BY MATCHING REPLAY."
+                                    )
+
+                            elif message.message_type not in {"fund.entry", "fund.exit"}:
+                                print("Lifecycle type ignored.")
+                                
+                            else:
+                                adapt_result = adapter.adapt(message)
+                                print(f"Adapter status: {adapt_result.status.value}")
+        
+                                if adapt_result.status is EagleTradeAdaptStatus.IGNORED_SYMBOL:
+                                    non_btc_events_ignored += 1
+                                    print("Non-BTC instrument ignored.")
+                                elif (
+                                    adapt_result.status
+                                    is EagleTradeAdaptStatus.IGNORED_UNKNOWN_EXIT
+                                ):
+                                    non_btc_events_ignored += 1
+                                    print("Unknown/non-BTC exit ignored.")
+                                elif adapt_result.status is EagleTradeAdaptStatus.ADAPTED:
+                                    btc_events_adapted += 1
+                                    normalized_event = adapt_result.event
+                                    if normalized_event is None:
+                                        raise RuntimeError(
+                                            "Adapted Eagle event contained no event."
+                                        )
+        
+                                    print(
+                                        "Normalized intent: "
+                                        f"{normalized_event.payload['intent']}"
+                                    )
+        
+                                    replay_decision = coordinator.process_event(
+                                        normalized_event
+                                    )
+                                    print(
+                                        "Replay trade decision: "
+                                        f"{replay_decision.reason}"
+                                    )
+        
+                                    if replay_decision.approved:
+                                        approved_decisions += 1
+                                    else:
+                                        rejected_decisions += 1
+        
+                                    print(
+                                        "REPLAY HARD STOP - historical event cannot "
+                                        "reach IB execution."
+                                    )
+        
+                        # -------------------------------------------------------------
+                        # LIVE lifecycle event.
+                        # In unarmed mode: inspect only; do not persist or mutate.
+                        # In armed mode: durable processing and execution are allowed.
+                        # -------------------------------------------------------------
+                        else:
+                            print(f"Lifecycle: {message.message_type}")
+                            print(f"Seq:       {message.seq}")
+                            print(f"Signal ID: {message.signal_id}")
+        
+                            if not post_replay_heartbeat_seen:
+                                raise RuntimeError(
+                                    "Live Eagle lifecycle arrived before required "
+                                    "post-replay heartbeat."
+                                )
+        
+                            if message.signal_id in missed_eagle_signal_ids:
+                                print(
+                                    "MISSED EAGLE TRADE LIFECYCLE IGNORED"
+                                )
+                                print(
+                                    f"Signal ID: {message.signal_id}"
+                                )
+                                print(
+                                    f"Lifecycle: {message.message_type}"
+                                )
+                                print(
+                                    "BTS never entered this Eagle trade; "
+                                    "NO broker order will be submitted."
+                                )
+        
+                                if armed:
+                                    missed_event_result = (
+                                        event_processor.process(
+                                            message
+                                        )
+                                    )
+                                    print(
+                                        "Event status: "
+                                        f"{missed_event_result.status.value}"
+                                    )
+                                else:
+                                    print(
+                                        "OBSERVE MODE - missed lifecycle event "
+                                        "was not persisted."
+                                    )
+        
+                                if message.message_type == "fund.exit":
+                                    missed_eagle_signal_ids.discard(
+                                        message.signal_id
+                                    )
+                                    print(
+                                        "Missed Eagle trade is now closed; "
+                                        "BTS remains flat and ready for the "
+                                        "next fresh BTC fund.entry."
+                                    )
+        
+                                continue
+        
+                            # Adapter is non-executing. It lets us identify BTC intent
+                            # before deciding whether armed durable processing is allowed.
+                            adapt_result = adapter.adapt(message)
+                            print(f"Adapter status: {adapt_result.status.value}")
+        
+                            if adapt_result.status is EagleTradeAdaptStatus.IGNORED_SYMBOL:
+                                non_btc_events_ignored += 1
+                                print("Non-BTC instrument ignored.")
+        
+                                if armed:
+                                    event_processor.process(message)
+                                else:
+                                    print(
+                                        "OBSERVE MODE - non-BTC lifecycle event was not "
+                                        "persisted; durable cursor unchanged."
+                                    )
+                                continue
+        
+                            if (
+                                adapt_result.status
+                                is EagleTradeAdaptStatus.IGNORED_UNKNOWN_EXIT
+                            ):
+                                non_btc_events_ignored += 1
+                                print("Unknown/non-BTC exit ignored.")
+        
+                                if armed:
+                                    event_processor.process(message)
+                                else:
+                                    print(
+                                        "OBSERVE MODE - unknown exit was not persisted; "
+                                        "durable cursor unchanged."
+                                    )
+                                continue
+        
+                            if adapt_result.status is not EagleTradeAdaptStatus.ADAPTED:
+                                raise RuntimeError(
+                                    f"Unsupported EagleTradeAdaptStatus: "
+                                    f"{adapt_result.status!r}."
+                                )
+        
+                            btc_events_adapted += 1
+                            normalized_event = adapt_result.event
+                            if normalized_event is None:
+                                raise RuntimeError("Adapted Eagle event contained no event.")
+        
+                            print(
+                                "Normalized intent: "
+                                f"{normalized_event.payload['intent']}"
+                            )
+        
+                            intended_intent = TradeIntent(
+                                normalized_event.payload["intent"]
+                            )
+        
+                            is_closing_intent = intended_intent in {
+                                TradeIntent.SELL_TO_CLOSE,
+                                TradeIntent.BUY_TO_CLOSE,
+                            }
+        
+                            # ---------------------------------------------------------
+                            # EXIT-OBLIGATION DURABILITY BOUNDARY
+                            # ---------------------------------------------------------
+                            if armed and is_closing_intent:
+                                require_execution_state_clear(
+                                    execution_ledger
+                                )
+        
+                                event_result = event_processor.process(
+                                    message
+                                )
+                                print(f"Event status: {event_result.status.value}")
+        
+                                if event_result.status is not EventProcessStatus.ACCEPTED:
+                                    print(
+                                        "Duplicate/out-of-sequence live exit stopped "
+                                        "before execution reservation."
                                     )
                                     continue
-
-                                rejected_decisions += 1
-
-                                print("Opening signal skipped because BTS/broker is already positioned.")
-                                print("No durable lifecycle was created for this signal.")
-                                print("No broker order was submitted.")
-                                print("Continuous trader remains active.")
+        
+                                prepared_decision = coordinator.prepare_event(
+                                    normalized_event
+                                )
+        
+                                print(
+                                    "Trade preparation approved: "
+                                    f"{prepared_decision.approved}"
+                                )
+                                print(
+                                    "Trade preparation reason:   "
+                                    f"{prepared_decision.reason}"
+                                )
+        
+                                if not prepared_decision.approved:
+                                    rejected_decisions += 1
+                                    print(
+                                        "Trade preparation rejected; "
+                                        "durable lifecycle was NOT mutated."
+                                    )
+                                    continue
+        
+                                trade_request = prepared_decision.trade_request
+        
+                                if trade_request is None:
+                                    raise RuntimeError(
+                                        "Approved prepared decision had no TradeRequest."
+                                    )
+        
+                                execution_client.reserve_execution(
+                                    trade_request
+                                )
+        
+                                print(
+                                    "Exit execution obligation durably RESERVED "
+                                    "before broker refresh."
+                                )
+                                print("Broker order has NOT been submitted.")
+        
+                                if not manager.ready:
+                                    try:
+                                        await asyncio.to_thread(
+                                            recover_ib_connection,
+                                            reserved_exit_event_id=trade_request.event_id,
+                                        )
+                                    except (
+                                        ConnectionError,
+                                        OSError,
+                                        TimeoutError,
+                                    ) as error:
+                                        rejected_decisions += 1
+        
+                                        print()
+                                        print(
+                                            "IB CONNECTION LOST - RESERVED EXIT PENDING"
+                                        )
+                                        print(f"{type(error).__name__}: {error}")
+                                        print(
+                                            "The durable exit obligation remains "
+                                            "RESERVED. No broker order was submitted."
+                                        )
+                                        print(
+                                            "Eagle listener remains active; BTS will "
+                                            "not convert this exit into a missed entry."
+                                        )
+                                        continue
+        
+                                refresh_position_snapshot(
+                                    app=app,
+                                    manager=manager,
+                                    broker_client=broker_client,
+                                )
+        
+                                broker_position, open_signals = (
+                                    reconcile_broker_and_lifecycle(
+                                        broker_client=broker_client,
+                                        lifecycle_database_path=lifecycle_database_path,
+                                        expected_local_symbol=execution_config.local_symbol,
+                                        expected_quantity=execution_config.quantity,
+                                    )
+                                )
+        
+                                validate_trade_request_against_position(
+                                    trade_request=trade_request,
+                                    broker_position=broker_position,
+                                    open_signals=open_signals,
+                                    expected_quantity=execution_config.quantity,
+                                )
+        
+                                risk_decision = risk_manager.evaluate(
+                                    trade_request,
+                                    current_position=broker_position,
+                                )
+        
+                                print(f"Risk approved: {risk_decision.approved}")
+                                print(
+                                    "Projected position: "
+                                    f"{risk_decision.projected_position}"
+                                )
+        
+                                if not risk_decision.approved:
+                                    rejected_decisions += 1
+                                    raise RuntimeError(
+                                        "RiskManager rejected RESERVED live Eagle close "
+                                        "TradeRequest BEFORE durable lifecycle mutation: "
+                                        f"{risk_decision.reason}"
+                                    )
+        
+                                expected_position = expected_position_after_trade(
+                                    trade_request
+                                )
+        
+                                if risk_decision.projected_position != expected_position:
+                                    raise RuntimeError(
+                                        "Risk projected position does not match "
+                                        "expected trade result."
+                                    )
+        
+                                readiness = IBTradingReadiness(
+                                    api_ready=app.api_ready,
+                                    order_id_allocator=app.order_id_allocator,
+                                    broker_client=broker_client,
+                                    trading_controls=trading_controls,
+                                    kill_switch=kill_switch,
+                                )
+        
+                                readiness_result = readiness.require_ready(
+                                    positions_reconciled=True,
+                                    execution_state_clear=True,
+                                )
+        
+                                print(f"IB readiness passed: {readiness_result.ready}")
+        
+                                broker_order_id = app.order_id_allocator.allocate()
+        
+                                print()
+                                print("=" * 72)
+                                print("LIVE PAPER ORDER AUTHORIZED")
+                                print("=" * 72)
+                                print(f"Eagle event: {trade_request.event_id}")
+                                print(f"Signal ID:   {trade_request.signal_id}")
+                                print(f"Intent:      {trade_request.intent.value}")
+                                print(f"Quantity:    {execution_config.quantity} MBT")
+                                print(f"IB order ID: {broker_order_id}")
+                                print("=" * 72)
+        
+                                submission = execution_client.submit_reserved(
+                                    trade_request,
+                                    contract_month=execution_config.contract_month,
+                                    broker_order_id=broker_order_id,
+                                )
+                                broker_submissions += 1
+        
+                                expected_action = expected_ib_action(trade_request)
+                                if submission.package.order.action != expected_action:
+                                    raise RuntimeError(
+                                        "IB order action does not match TradeRequest."
+                                    )
+        
+                                if (
+                                    submission.package.order.totalQuantity
+                                    != execution_config.quantity
+                                ):
+                                    raise RuntimeError(
+                                        "IB order quantity does not match approved runtime quantity."
+                                    )
+        
+                                final_record = wait_for_execution_resolution(
+                                    execution_ledger=execution_ledger,
+                                    event_id=trade_request.event_id,
+                                    kill_switch=kill_switch,
+                                    timeout_seconds=EXECUTION_TIMEOUT_SECONDS,
+                                )
+        
+                                if final_record.status is not ExecutionStatus.FILLED:
+                                    raise RuntimeError(
+                                        "Paper order did not reach FILLED. "
+                                        f"Status: {final_record.status.value}. "
+                                        f"Reason: {final_record.reason}"
+                                    )
+        
+                                filled_orders += 1
+        
+                                # Broker has confirmed the close FILLED.
+                                # Only now may BTS commit the durable lifecycle close.
+                                decision = coordinator.commit_request(
+                                    trade_request
+                                )
+        
+                                print(f"Trade decision approved: {decision.approved}")
+                                print(f"Trade decision reason:   {decision.reason}")
+        
+                                if not decision.approved:
+                                    raise RuntimeError(
+                                        "Broker close FILLED but durable lifecycle "
+                                        "commit was rejected."
+                                    )
+        
+                                approved_decisions += 1
+        
+                                committed_trade_request = decision.trade_request
+        
+                                if committed_trade_request is None:
+                                    raise RuntimeError(
+                                        "Approved lifecycle commit had no TradeRequest."
+                                    )
+        
+                                if committed_trade_request != trade_request:
+                                    raise RuntimeError(
+                                        "Committed TradeRequest does not match "
+                                        "the filled TradeRequest."
+                                    )
+        
+                                post_decision_open_signals = load_durable_open_signals(
+                                    lifecycle_database_path
+                                )
+        
+                                if post_decision_open_signals:
+                                    raise RuntimeError(
+                                        "Filled close did not leave durable lifecycle flat."
+                                    )
+        
+                                refresh_position_snapshot(
+                                    app=app,
+                                    manager=manager,
+                                    broker_client=broker_client,
+                                )
+        
+                                reconciled_position, reconciled_open_signals = (
+                                    reconcile_broker_and_lifecycle(
+                                        broker_client=broker_client,
+                                        lifecycle_database_path=lifecycle_database_path,
+                                        expected_local_symbol=execution_config.local_symbol,
+                                        expected_quantity=execution_config.quantity,
+                                    )
+                                )
+        
+                                if reconciled_position != expected_position:
+                                    raise RuntimeError(
+                                        "Post-fill broker position does not match "
+                                        "expected position."
+                                    )
+        
+                                print()
+                                print("PAPER ORDER FILLED AND RECONCILED.")
+                                print(f"Current MBT position: {reconciled_position}")
+                                print(
+                                    "Durable open signals: "
+                                    f"{len(reconciled_open_signals)}"
+                                )
+        
                                 continue
-
-                            raise RuntimeError(
-                                "Live opening signal blocked because BTS/broker "
-                                "is not flat."
+        
+                            # ---------------------------------------------------------
+                            # FRESH ENTRY IB-RECOVERY BOUNDARY
+                            # ---------------------------------------------------------
+                            # A stale local connection flag must not cause BTS to miss
+                            # an otherwise valid fresh Eagle entry. Before the normal
+                            # broker snapshot/readiness path, make a fresh paper-TWS
+                            # recovery attempt. If TWS is still unavailable after the
+                            # bounded recovery cycle, consume this entry as missed so
+                            # BTS will never chase it after reconnect.
+                            if (
+                                armed
+                                and intended_intent
+                                in {
+                                    TradeIntent.BUY_TO_OPEN,
+                                    TradeIntent.SELL_TO_OPEN,
+                                }
+                                and not manager.ready
+                            ):
+                                try:
+                                    await asyncio.to_thread(
+                                        recover_ib_connection
+                                    )
+                                except (
+                                    ConnectionError,
+                                    OSError,
+                                    TimeoutError,
+                                ) as error:
+                                    event_result = event_processor.process(
+                                        message
+                                    )
+                                    print(
+                                        f"Event status: {event_result.status.value}"
+                                    )
+        
+                                    if (
+                                        event_result.status
+                                        is not EventProcessStatus.ACCEPTED
+                                    ):
+                                        print(
+                                            "Duplicate/out-of-sequence live entry "
+                                            "stopped before missed-entry handling."
+                                        )
+                                        continue
+        
+                                    missed_eagle_signal_ids.add(
+                                        message.signal_id
+                                    )
+                                    rejected_decisions += 1
+        
+                                    print()
+                                    print(
+                                        "IB CONNECTION LOST - ENTRY MARKED MISSED"
+                                    )
+                                    print(f"{type(error).__name__}: {error}")
+                                    print(
+                                        "BTS did not enter this Eagle trade and will "
+                                        "not chase it after the paper TWS connection "
+                                        "returns."
+                                    )
+                                    print(
+                                        "Eagle listener remains active; the matching "
+                                        "exit will be consumed without a broker order."
+                                    )
+                                    continue
+        
+                            refresh_position_snapshot(
+                                app=app,
+                                manager=manager,
+                                broker_client=broker_client,
                             )
-                    elif intended_intent in {
-                        TradeIntent.SELL_TO_CLOSE,
-                        TradeIntent.BUY_TO_CLOSE,
-                    }:
-                        if len(open_signals) != 1:
-                            raise RuntimeError(
-                                "Live closing signal requires exactly one durable "
-                                "open signal."
+        
+                            broker_position, open_signals = reconcile_broker_and_lifecycle(
+                                broker_client=broker_client,
+                                lifecycle_database_path=lifecycle_database_path,
+                                expected_local_symbol=execution_config.local_symbol,
+                                expected_quantity=execution_config.quantity,
                             )
-                        if open_signals[0].signal_id != normalized_event.signal_id:
-                            raise RuntimeError(
-                                "Live closing signal does not match durable open signal."
+        
+                            require_execution_state_clear(execution_ledger)
+        
+                            if intended_intent in {
+                                TradeIntent.BUY_TO_OPEN,
+                                TradeIntent.SELL_TO_OPEN,
+                            }:
+                                if broker_position != 0 or open_signals:
+                                    if armed:
+                                        event_result = event_processor.process(message)
+                                        print(f"Event status: {event_result.status.value}")
+        
+                                        if (
+                                            event_result.status
+                                            is not EventProcessStatus.ACCEPTED
+                                        ):
+                                            print(
+                                                "Duplicate/out-of-sequence live event "
+                                                "stopped before second-entry skip handling."
+                                            )
+                                            continue
+        
+                                        rejected_decisions += 1
+        
+                                        print("Opening signal skipped because BTS/broker is already positioned.")
+                                        print("No durable lifecycle was created for this signal.")
+                                        print("No broker order was submitted.")
+                                        print("Continuous trader remains active.")
+                                        continue
+        
+                                    raise RuntimeError(
+                                        "Live opening signal blocked because BTS/broker "
+                                        "is not flat."
+                                    )
+                            elif intended_intent in {
+                                TradeIntent.SELL_TO_CLOSE,
+                                TradeIntent.BUY_TO_CLOSE,
+                            }:
+                                if len(open_signals) != 1:
+                                    raise RuntimeError(
+                                        "Live closing signal requires exactly one durable "
+                                        "open signal."
+                                    )
+                                if open_signals[0].signal_id != normalized_event.signal_id:
+                                    raise RuntimeError(
+                                        "Live closing signal does not match durable open signal."
+                                    )
+        
+                            # ---------------------------------
+                            # OBSERVE-ONLY HARD BOUNDARY
+                            #
+                            # TradeCoordinator mutates durable
+                            # signal lifecycle state. Therefore
+                            # it must never be called unless
+                            # continuous paper execution is
+                            # explicitly armed.
+                            # ---------------------------------
+                            if not armed:
+                                print("OBSERVE-ONLY HARD STOP.")
+                                print(
+                                    "Live BTC signal validated through pre-mutation safety "
+                                    "checks."
+                                )
+                                print("TradeCoordinator was NOT called.")
+                                print("Durable lifecycle was NOT mutated.")
+                                print("RiskManager was NOT called.")
+                                print("IBExecutionClient.submit was NOT called.")
+                                print(
+                                    "Live lifecycle event was NOT persisted; durable cursor "
+                                    "was NOT advanced."
+                                )
+                                continue
+        
+                            # Armed path begins here. First durably accept the live frame.
+                            event_result = event_processor.process(message)
+                            print(f"Event status: {event_result.status.value}")
+        
+                            if event_result.status is not EventProcessStatus.ACCEPTED:
+                                print(
+                                    "Duplicate/out-of-sequence live event stopped before "
+                                    "TradeCoordinator."
+                                )
+                                continue
+        
+                            prepared_decision = (
+                                coordinator.prepare_event(
+                                    normalized_event
+                                )
                             )
-
-                    # ---------------------------------
-                    # OBSERVE-ONLY HARD BOUNDARY
-                    #
-                    # TradeCoordinator mutates durable
-                    # signal lifecycle state. Therefore
-                    # it must never be called unless
-                    # continuous paper execution is
-                    # explicitly armed.
-                    # ---------------------------------
-                    if not armed:
-                        print("OBSERVE-ONLY HARD STOP.")
-                        print(
-                            "Live BTC signal validated through pre-mutation safety "
-                            "checks."
-                        )
-                        print("TradeCoordinator was NOT called.")
-                        print("Durable lifecycle was NOT mutated.")
-                        print("RiskManager was NOT called.")
-                        print("IBExecutionClient.submit was NOT called.")
-                        print(
-                            "Live lifecycle event was NOT persisted; durable cursor "
-                            "was NOT advanced."
-                        )
-                        continue
-
-                    # Armed path begins here. First durably accept the live frame.
-                    event_result = event_processor.process(message)
-                    print(f"Event status: {event_result.status.value}")
-
-                    if event_result.status is not EventProcessStatus.ACCEPTED:
-                        print(
-                            "Duplicate/out-of-sequence live event stopped before "
-                            "TradeCoordinator."
-                        )
-                        continue
-
-                    prepared_decision = (
-                        coordinator.prepare_event(
-                            normalized_event
-                        )
-                    )
-
-                    print(
-                        "Trade preparation approved: "
-                        f"{prepared_decision.approved}"
-                    )
-                    print(
-                        "Trade preparation reason:   "
-                        f"{prepared_decision.reason}"
-                    )
-
-                    if not prepared_decision.approved:
-                        rejected_decisions += 1
-                        print(
-                            "Trade preparation rejected; "
-                            "durable lifecycle was NOT mutated."
-                        )
-                        continue
-
-                    trade_request = prepared_decision.trade_request
-
-                    if trade_request is None:
-                        raise RuntimeError(
-                            "Approved prepared decision had no TradeRequest."
-                        )
-
-                    validate_trade_request_against_position(
-                        trade_request=trade_request,
-                        broker_position=broker_position,
-                        open_signals=open_signals,
-                        expected_quantity=execution_config.quantity,
-                    )
-
-                    risk_decision = risk_manager.evaluate(
-                        trade_request,
-                        current_position=broker_position,
-                    )
-
-                    print(f"Risk approved: {risk_decision.approved}")
-                    print(
-                        "Projected position: "
-                        f"{risk_decision.projected_position}"
-                    )
-
-                    if not risk_decision.approved:
-                        rejected_decisions += 1
-                        raise RuntimeError(
-                            "RiskManager rejected live Eagle TradeRequest "
-                            "BEFORE durable lifecycle mutation: "
-                            f"{risk_decision.reason}"
-                        )
-
-                    expected_position = expected_position_after_trade(
-                        trade_request
-                    )
-
-                    if risk_decision.projected_position != expected_position:
-                        raise RuntimeError(
-                            "Risk projected position does not match "
-                            "expected trade result."
-                        )
-
-                    readiness = IBTradingReadiness(
-                        api_ready=app.api_ready,
-                        order_id_allocator=app.order_id_allocator,
-                        broker_client=broker_client,
-                        trading_controls=trading_controls,
-                        kill_switch=kill_switch,
-                    )
-
-                    readiness_result = readiness.require_ready(
-                        positions_reconciled=True,
-                        execution_state_clear=True,
-                    )
-
-                    print(
-                        f"IB readiness passed: {readiness_result.ready}"
-                    )
-
-                    # All external safety checks have passed.
-                    # Only now may BTS commit the durable Eagle lifecycle transition.
-                    decision = coordinator.commit_request(
-                        trade_request
-                    )
-
-                    print(f"Trade decision approved: {decision.approved}")
-                    print(f"Trade decision reason:   {decision.reason}")
-
-                    if not decision.approved:
-                        rejected_decisions += 1
-                        print(
-                            "Lifecycle commit rejected; "
-                            "no broker submission."
-                        )
-                        continue
-
-                    approved_decisions += 1
-
-                    committed_trade_request = decision.trade_request
-
-                    if committed_trade_request is None:
-                        raise RuntimeError(
-                            "Approved lifecycle commit had no TradeRequest."
-                        )
-
-                    if committed_trade_request != trade_request:
-                        raise RuntimeError(
-                            "Committed TradeRequest does not match "
-                            "the risk-approved TradeRequest."
-                        )
-
-                    post_decision_open_signals = load_durable_open_signals(
-                        lifecycle_database_path
-                    )
-
-                    if expected_position == 0:
-                        if post_decision_open_signals:
-                            raise RuntimeError(
-                                "Close decision did not leave durable lifecycle flat."
+        
+                            print(
+                                "Trade preparation approved: "
+                                f"{prepared_decision.approved}"
                             )
+                            print(
+                                "Trade preparation reason:   "
+                                f"{prepared_decision.reason}"
+                            )
+        
+                            if not prepared_decision.approved:
+                                rejected_decisions += 1
+                                print(
+                                    "Trade preparation rejected; "
+                                    "durable lifecycle was NOT mutated."
+                                )
+                                continue
+        
+                            trade_request = prepared_decision.trade_request
+        
+                            if trade_request is None:
+                                raise RuntimeError(
+                                    "Approved prepared decision had no TradeRequest."
+                                )
+        
+                            validate_trade_request_against_position(
+                                trade_request=trade_request,
+                                broker_position=broker_position,
+                                open_signals=open_signals,
+                                expected_quantity=execution_config.quantity,
+                            )
+        
+                            risk_decision = risk_manager.evaluate(
+                                trade_request,
+                                current_position=broker_position,
+                            )
+        
+                            print(f"Risk approved: {risk_decision.approved}")
+                            print(
+                                "Projected position: "
+                                f"{risk_decision.projected_position}"
+                            )
+        
+                            if not risk_decision.approved:
+                                rejected_decisions += 1
+                                raise RuntimeError(
+                                    "RiskManager rejected live Eagle TradeRequest "
+                                    "BEFORE durable lifecycle mutation: "
+                                    f"{risk_decision.reason}"
+                                )
+        
+                            expected_position = expected_position_after_trade(
+                                trade_request
+                            )
+        
+                            if risk_decision.projected_position != expected_position:
+                                raise RuntimeError(
+                                    "Risk projected position does not match "
+                                    "expected trade result."
+                                )
+        
+                            readiness = IBTradingReadiness(
+                                api_ready=app.api_ready,
+                                order_id_allocator=app.order_id_allocator,
+                                broker_client=broker_client,
+                                trading_controls=trading_controls,
+                                kill_switch=kill_switch,
+                            )
+        
+                            readiness_result = readiness.require_ready(
+                                positions_reconciled=True,
+                                execution_state_clear=True,
+                            )
+        
+                            print(
+                                f"IB readiness passed: {readiness_result.ready}"
+                            )
+        
+                            # All external safety checks have passed.
+                            # Only now may BTS commit the durable Eagle lifecycle transition.
+                            decision = coordinator.commit_request(
+                                trade_request
+                            )
+        
+                            print(f"Trade decision approved: {decision.approved}")
+                            print(f"Trade decision reason:   {decision.reason}")
+        
+                            if not decision.approved:
+                                rejected_decisions += 1
+                                print(
+                                    "Lifecycle commit rejected; "
+                                    "no broker submission."
+                                )
+                                continue
+        
+                            approved_decisions += 1
+        
+                            committed_trade_request = decision.trade_request
+        
+                            if committed_trade_request is None:
+                                raise RuntimeError(
+                                    "Approved lifecycle commit had no TradeRequest."
+                                )
+        
+                            if committed_trade_request != trade_request:
+                                raise RuntimeError(
+                                    "Committed TradeRequest does not match "
+                                    "the risk-approved TradeRequest."
+                                )
+        
+                            post_decision_open_signals = load_durable_open_signals(
+                                lifecycle_database_path
+                            )
+        
+                            if expected_position == 0:
+                                if post_decision_open_signals:
+                                    raise RuntimeError(
+                                        "Close decision did not leave durable lifecycle flat."
+                                    )
+                            else:
+                                if len(post_decision_open_signals) != 1:
+                                    raise RuntimeError(
+                                        "Open decision did not create exactly one durable "
+                                        "open signal."
+                                    )
+        
+                                expected_state = (
+                                    SignalLifecycleState.LONG_OPEN
+                                    if expected_position > 0
+                                    else SignalLifecycleState.SHORT_OPEN
+                                )
+        
+                                durable_open = post_decision_open_signals[0]
+        
+                                if (
+                                    durable_open.signal_id != trade_request.signal_id
+                                    or durable_open.state is not expected_state
+                                ):
+                                    raise RuntimeError(
+                                        "Post-decision durable lifecycle does not match "
+                                        "the TradeRequest."
+                                    )
+        
+                            broker_order_id = app.order_id_allocator.allocate()
+        
+                            print()
+                            print("=" * 72)
+                            print("LIVE PAPER ORDER AUTHORIZED")
+                            print("=" * 72)
+                            print(f"Eagle event: {trade_request.event_id}")
+                            print(f"Signal ID:   {trade_request.signal_id}")
+                            print(f"Intent:      {trade_request.intent.value}")
+                            print(f"Quantity:    {execution_config.quantity} MBT")
+                            print(f"IB order ID: {broker_order_id}")
+                            print("=" * 72)
+        
+                            submission = execution_client.submit(
+                                trade_request,
+                                contract_month=execution_config.contract_month,
+                                broker_order_id=broker_order_id,
+                            )
+                            broker_submissions += 1
+        
+                            expected_action = expected_ib_action(trade_request)
+                            if submission.package.order.action != expected_action:
+                                raise RuntimeError(
+                                    "IB order action does not match TradeRequest."
+                                )
+        
+                            if (
+                                submission.package.order.totalQuantity
+                                != execution_config.quantity
+                            ):
+                                raise RuntimeError(
+                                    "IB order quantity does not match approved runtime quantity."
+                                )
+        
+                            final_record = wait_for_execution_resolution(
+                                execution_ledger=execution_ledger,
+                                event_id=trade_request.event_id,
+                                kill_switch=kill_switch,
+                                timeout_seconds=EXECUTION_TIMEOUT_SECONDS,
+                            )
+        
+                            if final_record.status is not ExecutionStatus.FILLED:
+                                raise RuntimeError(
+                                    "Paper order did not reach FILLED. "
+                                    f"Status: {final_record.status.value}. "
+                                    f"Reason: {final_record.reason}"
+                                )
+        
+                            filled_orders += 1
+        
+                            refresh_position_snapshot(
+                                app=app,
+                                manager=manager,
+                                broker_client=broker_client,
+                            )
+        
+                            reconciled_position, reconciled_open_signals = (
+                                reconcile_broker_and_lifecycle(
+                                    broker_client=broker_client,
+                                    lifecycle_database_path=lifecycle_database_path,
+                                    expected_local_symbol=execution_config.local_symbol,
+                                    expected_quantity=execution_config.quantity,
+                                )
+                            )
+        
+                            if reconciled_position != expected_position:
+                                raise RuntimeError(
+                                    "Post-fill broker position does not match expected position."
+                                )
+        
+                            print()
+                            print("PAPER ORDER FILLED AND RECONCILED.")
+                            print(f"Current MBT position: {reconciled_position}")
+                            print(
+                                "Durable open signals: "
+                                f"{len(reconciled_open_signals)}"
+                            )
+        
                     else:
-                        if len(post_decision_open_signals) != 1:
-                            raise RuntimeError(
-                                "Open decision did not create exactly one durable "
-                                "open signal."
-                            )
-
-                        expected_state = (
-                            SignalLifecycleState.LONG_OPEN
-                            if expected_position > 0
-                            else SignalLifecycleState.SHORT_OPEN
-                        )
-
-                        durable_open = post_decision_open_signals[0]
-
-                        if (
-                            durable_open.signal_id != trade_request.signal_id
-                            or durable_open.state is not expected_state
-                        ):
-                            raise RuntimeError(
-                                "Post-decision durable lifecycle does not match "
-                                "the TradeRequest."
-                            )
-
-                    broker_order_id = app.order_id_allocator.allocate()
-
-                    print()
-                    print("=" * 72)
-                    print("LIVE PAPER ORDER AUTHORIZED")
-                    print("=" * 72)
-                    print(f"Eagle event: {trade_request.event_id}")
-                    print(f"Signal ID:   {trade_request.signal_id}")
-                    print(f"Intent:      {trade_request.intent.value}")
-                    print(f"Quantity:    {execution_config.quantity} MBT")
-                    print(f"IB order ID: {broker_order_id}")
-                    print("=" * 72)
-
-                    submission = execution_client.submit(
-                        trade_request,
-                        contract_month=execution_config.contract_month,
-                        broker_order_id=broker_order_id,
-                    )
-                    broker_submissions += 1
-
-                    expected_action = expected_ib_action(trade_request)
-                    if submission.package.order.action != expected_action:
                         raise RuntimeError(
-                            "IB order action does not match TradeRequest."
+                            f"Unsupported Eagle message: {type(message).__name__}"
                         )
+        
+                    if max_messages > 0 and messages_observed >= max_messages:
+                        print()
+                        print("Configured message limit reached.")
+                        stop_requested = True
+                        break
+        
 
-                    if (
-                        submission.package.order.totalQuantity
-                        != execution_config.quantity
-                    ):
-                        raise RuntimeError(
-                            "IB order quantity does not match approved runtime quantity."
-                        )
+                if stop_requested:
+                    break
 
-                    final_record = wait_for_execution_resolution(
-                        execution_ledger=execution_ledger,
-                        event_id=trade_request.event_id,
-                        kill_switch=kill_switch,
-                        timeout_seconds=EXECUTION_TIMEOUT_SECONDS,
-                    )
-
-                    if final_record.status is not ExecutionStatus.FILLED:
-                        raise RuntimeError(
-                            "Paper order did not reach FILLED. "
-                            f"Status: {final_record.status.value}. "
-                            f"Reason: {final_record.reason}"
-                        )
-
-                    filled_orders += 1
-
-                    refresh_position_snapshot(
-                        app=app,
-                        manager=manager,
-                        broker_client=broker_client,
-                    )
-
-                    reconciled_position, reconciled_open_signals = (
-                        reconcile_broker_and_lifecycle(
-                            broker_client=broker_client,
-                            lifecycle_database_path=lifecycle_database_path,
-                            expected_local_symbol=execution_config.local_symbol,
-                            expected_quantity=execution_config.quantity,
-                        )
-                    )
-
-                    if reconciled_position != expected_position:
-                        raise RuntimeError(
-                            "Post-fill broker position does not match expected position."
-                        )
-
-                    print()
-                    print("PAPER ORDER FILLED AND RECONCILED.")
-                    print(f"Current MBT position: {reconciled_position}")
-                    print(
-                        "Durable open signals: "
-                        f"{len(reconciled_open_signals)}"
-                    )
-
-            else:
-                raise RuntimeError(
-                    f"Unsupported Eagle message: {type(message).__name__}"
+                raise ConnectionError(
+                    "The Eagle WebSocket listener ended unexpectedly."
                 )
 
-            if max_messages > 0 and messages_observed >= max_messages:
-                print()
-                print("Configured message limit reached.")
-                break
+            except EagleAuthenticationError:
+                # Authentication failures require operator action and are never
+                # treated as a transient transport outage.
+                raise
 
+            except EagleRateLimitError as error:
+                hello_received = False
+                staging_confirmed = False
+                replay_expected = 0
+                replay_processed = 0
+                replay_complete = False
+                post_replay_heartbeat_seen = False
+                possible_pending_gap_exit = False
+                eagle_session_is_reconnect = True
+                missed_eagle_signal_ids.clear()
+
+                delay_index = min(
+                    eagle_reconnect_attempt,
+                    len(EAGLE_RECONNECT_DELAYS_SECONDS) - 1,
+                )
+
+                reconnect_delay = EAGLE_RECONNECT_DELAYS_SECONDS[
+                    delay_index
+                ]
+
+                if error.retry_after_seconds is not None:
+                    reconnect_delay = max(
+                        reconnect_delay,
+                        float(error.retry_after_seconds),
+                    )
+
+                print()
+                print("EAGLE RATE LIMITED - BROKER EXECUTION BLOCKED")
+                print(f"{type(error).__name__}: {error}")
+                print(
+                    "BTS will reconnect from the latest durable Eagle cursor."
+                )
+                print("Historical replay remains non-executable.")
+                print(
+                    "A fresh LIVE hello and post-replay heartbeat "
+                    "will be required before execution resumes."
+                )
+                print(
+                    f"Waiting {reconnect_delay:.1f} seconds before "
+                    "the next Eagle reconnect attempt."
+                )
+
+                await asyncio.sleep(reconnect_delay)
+
+                eagle_reconnect_attempt += 1
+                eagle_client = build_eagle_client()
+
+                print(
+                    "Attempting Eagle reconnect using latest durable cursor..."
+                )
+
+            except (ConnectionError, OSError, TimeoutError) as error:
+                # A disconnected Eagle session is not allowed to inherit stale
+                # hello/replay authorization. Broker execution remains gated
+                # until a replacement client receives a fresh LIVE hello and a
+                # fresh post-replay heartbeat.
+                hello_received = False
+                staging_confirmed = False
+                replay_expected = 0
+                replay_processed = 0
+                replay_complete = False
+                post_replay_heartbeat_seen = False
+                possible_pending_gap_exit = False
+                eagle_session_is_reconnect = True
+                missed_eagle_signal_ids.clear()
+
+                reconnect_delay = EAGLE_RECONNECT_DELAYS_SECONDS[
+                    min(
+                        eagle_reconnect_attempt,
+                        len(EAGLE_RECONNECT_DELAYS_SECONDS) - 1,
+                    )
+                ]
+                eagle_reconnect_attempt += 1
+
+                print()
+                print("EAGLE CONNECTION LOST - BROKER EXECUTION BLOCKED")
+                print(f"{type(error).__name__}: {error}")
+                print(
+                    "Eagle listener will reconnect from the latest durable "
+                    "cursor. Historical replay remains non-executable."
+                )
+                print(
+                    "A fresh LIVE fund.hello and post-replay heartbeat are "
+                    "required before new live broker execution can resume."
+                )
+                print(f"Reconnect retry in {reconnect_delay:g} seconds.")
+
+                await asyncio.sleep(reconnect_delay)
+                eagle_client = build_eagle_client()
+
+                print()
+                print("EAGLE RECONNECT ATTEMPT")
+                print(f"Eagle URI: {eagle_client._connection_uri()}")
+                continue
         refresh_position_snapshot(
             app=app,
             manager=manager,

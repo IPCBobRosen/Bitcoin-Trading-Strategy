@@ -230,3 +230,118 @@ def test_atomic_sequence_gap_is_allowed(
     assert result == EventProcessingResult.ACCEPTED
     assert store.has_processed_event("event-150") is True
     assert store.get_last_seq() == 150
+
+def test_check_event_with_seq_does_not_mutate_state(tmp_path) -> None:
+    """Read-only event eligibility checks must not persist event or sequence."""
+
+    database_path = tmp_path / "events.db"
+    store = EventStore(database_path)
+
+    result = store.check_event_with_seq(
+        "event-100",
+        100,
+    )
+
+    assert result is EventProcessingResult.ACCEPTED
+
+    # Read-only eligibility check must not consume the event.
+    assert store.has_processed_event("event-100") is False
+
+    # It must not advance the durable sequence cursor either.
+    assert store.get_last_seq() is None
+
+    # The normal durable operation must still be able to accept it afterward.
+    durable_result = store.check_and_mark_event_with_seq(
+        "event-100",
+        100,
+    )
+
+    assert durable_result is EventProcessingResult.ACCEPTED
+    assert store.has_processed_event("event-100") is True
+    assert store.get_last_seq() == 100
+
+def test_check_event_with_seq_detects_duplicate_without_mutating_state(
+    tmp_path,
+) -> None:
+    """Read-only check must identify an already processed event."""
+
+    database_path = tmp_path / "events.db"
+    store = EventStore(database_path)
+
+    durable_result = store.check_and_mark_event_with_seq(
+        "event-100",
+        100,
+    )
+
+    assert durable_result is EventProcessingResult.ACCEPTED
+
+    result = store.check_event_with_seq(
+        "event-100",
+        101,
+    )
+
+    assert result is EventProcessingResult.DUPLICATE_EVENT
+
+    # Read-only check must not advance the cursor.
+    assert store.get_last_seq() == 100
+
+
+def test_check_event_with_seq_detects_out_of_sequence_without_mutating_state(
+    tmp_path,
+) -> None:
+    """Read-only check must reject an older sequence without mutation."""
+
+    database_path = tmp_path / "events.db"
+    store = EventStore(database_path)
+
+    durable_result = store.check_and_mark_event_with_seq(
+        "event-100",
+        100,
+    )
+
+    assert durable_result is EventProcessingResult.ACCEPTED
+
+    result = store.check_event_with_seq(
+        "event-99",
+        99,
+    )
+
+    assert result is EventProcessingResult.OUT_OF_SEQUENCE
+
+    # New event ID must not have been persisted.
+    assert store.has_processed_event("event-99") is False
+
+    # Read-only check must not move the durable cursor.
+    assert store.get_last_seq() == 100
+
+def test_has_processed_event_is_read_only(
+    tmp_path: Path,
+) -> None:
+    """has_processed_event must never mutate event or sequence state."""
+
+    database_path = tmp_path / "events.db"
+    store = EventStore(database_path)
+
+    durable_result = store.check_and_mark_event_with_seq(
+        "existing-event",
+        50,
+    )
+
+    assert durable_result is EventProcessingResult.ACCEPTED
+    assert store.get_last_seq() == 50
+
+    # Existing event is correctly recognized.
+    assert store.has_processed_event("existing-event") is True
+
+    # Missing event is correctly reported absent.
+    assert store.has_processed_event("missing-event") is False
+
+    # Read-only lookups must not move the durable cursor.
+    assert store.get_last_seq() == 50
+
+    # A lookup for a missing event must not accidentally persist it.
+    assert store.has_processed_event("missing-event") is False
+
+    # Existing durable event remains intact.
+    assert store.has_processed_event("existing-event") is True
+    assert store.get_last_seq() == 50

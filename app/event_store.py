@@ -265,6 +265,77 @@ class EventStore:
 
             return True
 
+    def check_event_with_seq(
+        self,
+        event_id: str,
+        seq: int,
+    ) -> EventProcessingResult:
+        """Evaluate an Eagle event and sequence without mutating state.
+
+        This method applies the same duplicate-event and sequence-order
+        checks as check_and_mark_event_with_seq(), but performs no INSERT,
+        UPDATE, or other durable state change.
+
+        Returns:
+            EventProcessingResult.ACCEPTED:
+                The event ID is new and the sequence is newer.
+
+            EventProcessingResult.DUPLICATE_EVENT:
+                The event ID has already been processed.
+
+            EventProcessingResult.OUT_OF_SEQUENCE:
+                The event ID is new, but the sequence is equal
+                to or older than the durable cursor.
+        """
+
+        self._validate_event_id(
+            event_id
+        )
+
+        self._validate_seq(
+            seq
+        )
+
+        with self._connect() as connection:
+            duplicate_row = connection.execute(
+                """
+                SELECT 1
+                FROM processed_events
+                WHERE event_id = ?
+                LIMIT 1
+                """,
+                (
+                    event_id,
+                ),
+            ).fetchone()
+
+            if duplicate_row is not None:
+                return (
+                    EventProcessingResult.DUPLICATE_EVENT
+                )
+
+            sequence_row = connection.execute(
+                """
+                SELECT last_seq
+                FROM sequence_state
+                WHERE id = 1
+                """
+            ).fetchone()
+
+            if sequence_row is not None:
+                current_seq = int(
+                    sequence_row[0]
+                )
+
+                if seq <= current_seq:
+                    return (
+                        EventProcessingResult.OUT_OF_SEQUENCE
+                    )
+
+        return (
+            EventProcessingResult.ACCEPTED
+        )
+
     def check_and_mark_event_with_seq(
         self,
         event_id: str,

@@ -3045,31 +3045,45 @@ def test_live_entry_checks_ib_recovery_before_broker_snapshot() -> None:
     live_index = source.index(
         "# LIVE lifecycle event."
     )
+
     closing_boundary_index = source.index(
         "if armed and is_closing_intent:",
         live_index,
     )
 
-    # The dedicated close branch ends with `continue`. The next broker refresh
-    # is the common non-closing path used by opening intents.
-    entry_refresh_anchor = (
-        "                        continue\n\n"
-        "                    refresh_position_snapshot("
-    )
-    entry_refresh_index = source.index(
-        entry_refresh_anchor,
+    # Locate the opening-intent IB recovery check after the dedicated
+    # closing-intent branch.
+    opening_recovery_condition_index = source.index(
+        "and not manager.ready",
         closing_boundary_index,
     )
 
-    entry_boundary_source = source[
-        closing_boundary_index:entry_refresh_index
+    recovery_call_index = source.index(
+        "recover_ib_connection",
+        opening_recovery_condition_index,
+    )
+
+    # The normal opening-intent broker refresh must occur only after
+    # the IB readiness/recovery check.
+    entry_refresh_index = source.index(
+        "refresh_position_snapshot(",
+        recovery_call_index,
+    )
+
+    assert closing_boundary_index < opening_recovery_condition_index
+    assert opening_recovery_condition_index < recovery_call_index
+    assert recovery_call_index < entry_refresh_index
+
+    recovery_block = source[
+        opening_recovery_condition_index:entry_refresh_index
     ]
 
-    assert "manager.ready" in entry_boundary_source
-    assert "await asyncio.to_thread(" in entry_boundary_source
-    assert "recover_ib_connection" in entry_boundary_source
-    assert "ConnectionError" in entry_boundary_source
-    assert "TimeoutError" in entry_boundary_source
+    # If IB recovery fails, the opening event is durably consumed and
+    # classified as missed rather than being chased after reconnection.
+    assert "event_processor.process(" in recovery_block
+    assert "missed_eagle_signal_ids.add(" in recovery_block
+    assert "continue" in recovery_block
+
 
 def test_live_exit_preserves_reserved_obligation_and_recovers_ib_before_submission() -> None:
     """A live exit must recover IB after reservation and before broker submission."""
@@ -3343,3 +3357,1319 @@ def test_real_reserved_exit_recovery_uses_ambiguous_submit_guard() -> None:
         guard_index:
     ]
 
+
+def test_runner_reconnects_eagle_from_latest_durable_cursor() -> None:
+    """Unexpected Eagle disconnect must reconnect from the latest durable cursor."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    helper_index = runner_source.index(
+        "def build_eagle_client("
+    )
+
+    live_loop_index = runner_source.index(
+        "async for message in eagle_client.listen():"
+    )
+
+    connection_lost_index = runner_source.index(
+        "EAGLE CONNECTION LOST",
+        live_loop_index,
+    )
+
+    reconnect_call_index = runner_source.index(
+        "eagle_client = build_eagle_client()",
+        connection_lost_index,
+    )
+
+    helper_source = runner_source[
+        helper_index:live_loop_index
+    ]
+
+    # The client factory must obtain the durable cursor at the time
+    # a client is built.
+    assert "event_store.get_last_seq()" in helper_source
+    assert "EagleClient(" in helper_source
+    assert "since_seq=latest_durable_cursor" in helper_source
+
+    # An unexpected Eagle disconnect must reach a reconnect boundary
+    # and rebuild the client after the connection-loss handler begins.
+    assert live_loop_index < connection_lost_index
+    assert connection_lost_index < reconnect_call_index
+
+def test_eagle_reconnect_client_uses_latest_durable_cursor() -> None:
+    """Replacement Eagle client must use the cursor durable at reconnect time."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    assert "def build_eagle_client(" in runner_source
+
+    helper_index = runner_source.index(
+        "def build_eagle_client("
+    )
+    client_call_index = runner_source.index(
+        "eagle_client = build_eagle_client()",
+        helper_index,
+    )
+
+    helper_source = runner_source[
+        helper_index:client_call_index
+    ]
+
+    assert "event_store.get_last_seq()" in helper_source
+    assert "EagleClient(" in helper_source
+    assert "since_seq=latest_durable_cursor" in helper_source
+
+    cursor_index = helper_source.index(
+        "event_store.get_last_seq()"
+    )
+    client_index = helper_source.index(
+        "EagleClient("
+    )
+    since_index = helper_source.index(
+        "since_seq=latest_durable_cursor"
+    )
+
+    assert cursor_index < client_index
+    assert client_index < since_index
+
+def test_eagle_reconnect_does_not_retry_authentication_failure() -> None:
+    """Eagle authentication failure must remain fatal, not reconnect forever."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    assert "EagleAuthenticationError" in source
+
+    assert (
+        "except EagleAuthenticationError:"
+        in runner_source
+        or "except EagleAuthenticationError as"
+        in runner_source
+    )
+
+    auth_handler_index = runner_source.index(
+        "except EagleAuthenticationError"
+    )
+
+    auth_handler_source = runner_source[
+        auth_handler_index:auth_handler_index + 500
+    ]
+
+    assert "raise" in auth_handler_source
+
+
+def test_eagle_disconnect_resets_session_authorization_gates_before_reconnect() -> None:
+    """A lost Eagle session must not carry authorization into its replacement."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    live_loop_index = runner_source.index(
+        "async for message in eagle_client.listen():"
+    )
+
+    connection_handler_index = runner_source.index(
+        "except (ConnectionError, OSError, TimeoutError) as error:",
+        live_loop_index,
+    )
+
+    reconnect_call_index = runner_source.index(
+        "eagle_client = build_eagle_client()",
+        connection_handler_index,
+    )
+
+    reconnect_boundary = runner_source[
+        connection_handler_index:reconnect_call_index
+    ]
+
+    required_resets = (
+        "hello_received = False",
+        "staging_confirmed = False",
+        "replay_expected = 0",
+        "replay_processed = 0",
+        "replay_complete = False",
+        "post_replay_heartbeat_seen = False",
+    )
+
+    for reset in required_resets:
+        assert reset in reconnect_boundary
+
+    # Missed-trade classification belongs to the old Eagle hello snapshot
+    # and must also be discarded before the replacement session begins.
+    assert "missed_eagle_signal_ids.clear()" in reconnect_boundary
+
+    # Every reset must occur before the replacement Eagle client is built.
+    for reset in required_resets:
+        assert (
+            runner_source.index(reset, connection_handler_index)
+            < reconnect_call_index
+        )
+
+    assert (
+        runner_source.index(
+            "missed_eagle_signal_ids.clear()",
+            connection_handler_index,
+        )
+        < reconnect_call_index
+    )
+
+
+def test_reconnected_eagle_hello_uses_fresh_broker_and_lifecycle_state() -> None:
+    """A fresh Eagle hello must reconcile against current BTS/broker state."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    hello_handler_index = runner_source.index(
+        "if isinstance(message, EagleHello):"
+    )
+
+    hello_handler_end = runner_source.index(
+        "continue",
+        hello_handler_index,
+    )
+
+    hello_source = runner_source[
+        hello_handler_index:hello_handler_end
+    ]
+
+    # A hello received after reconnect must refresh the broker snapshot.
+    assert "refresh_position_snapshot" in hello_source
+
+    # It must then perform a fresh broker/lifecycle reconciliation.
+    assert "reconcile_broker_and_lifecycle(" in hello_source
+
+    # The resulting current state must be used for hello validation.
+    assert "hello_broker_position" in hello_source
+    assert "hello_open_signals" in hello_source
+
+    # Process-start snapshots must not be used to authorize a replacement
+    # Eagle session.
+    assert "starting_position" not in hello_source
+    assert "starting_open_signals" not in hello_source
+
+
+def test_reconnected_session_requires_fresh_post_replay_heartbeat_before_live_lifecycle() -> None:
+    """Reconnect must not inherit the old session's live-execution heartbeat gate."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    # Locate the transient Eagle disconnect handler.
+    disconnect_index = runner_source.index(
+        "except (ConnectionError, OSError, TimeoutError) as error:"
+    )
+
+    reconnect_call_index = runner_source.index(
+        "eagle_client = build_eagle_client()",
+        disconnect_index,
+    )
+
+    # The old session's heartbeat authorization must be cleared before
+    # the replacement Eagle client is constructed.
+    heartbeat_reset_index = runner_source.index(
+        "post_replay_heartbeat_seen = False",
+        disconnect_index,
+    )
+
+    assert heartbeat_reset_index < reconnect_call_index
+
+    # Locate the fresh hello handler after entering the continuous listener.
+    hello_index = runner_source.index(
+        "if isinstance(message, EagleHello):"
+    )
+
+    heartbeat_handler_index = runner_source.index(
+        "elif isinstance(message, EagleHeartbeat):",
+        hello_index,
+    )
+
+    live_lifecycle_index = runner_source.index(
+        "# LIVE lifecycle event.",
+        heartbeat_handler_index,
+    )
+
+    live_gate_index = runner_source.index(
+        "if not post_replay_heartbeat_seen:",
+        live_lifecycle_index,
+    )
+
+    live_gate_raise_index = runner_source.index(
+        "raise RuntimeError(",
+        live_gate_index,
+    )
+
+    live_gate_message_index = runner_source.index(
+        '"Live Eagle lifecycle arrived before required "',
+        live_gate_raise_index,
+    )
+
+    # Every fresh hello must itself remove heartbeat authorization.
+    hello_source = runner_source[
+        hello_index:heartbeat_handler_index
+    ]
+    assert "post_replay_heartbeat_seen = False" in hello_source
+
+    # A live lifecycle event must hit the heartbeat gate before reaching
+    # the normal opening/closing execution paths.
+    closing_execution_index = runner_source.index(
+        "if armed and is_closing_intent:",
+        live_lifecycle_index,
+    )
+
+    assert live_lifecycle_index < live_gate_index
+    assert live_gate_index < live_gate_raise_index
+    assert live_gate_raise_index < live_gate_message_index
+    assert live_gate_index < closing_execution_index
+
+
+def test_eagle_rate_limit_honors_retry_after_without_shortening_backoff() -> None:
+    """HTTP 429 Retry-After may extend, but never shorten, reconnect backoff."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    assert "EagleRateLimitError" in source
+
+    rate_limit_handler_index = runner_source.index(
+        "except EagleRateLimitError"
+    )
+
+    transient_handler_index = runner_source.index(
+        "except (ConnectionError, OSError, TimeoutError) as error:",
+        rate_limit_handler_index,
+    )
+
+    rate_limit_source = runner_source[
+        rate_limit_handler_index:transient_handler_index
+    ]
+
+    assert "error.retry_after_seconds" in rate_limit_source
+    assert "max(" in rate_limit_source
+    assert "await asyncio.sleep(" in rate_limit_source
+    assert "eagle_client = build_eagle_client()" in rate_limit_source
+
+
+def test_replayed_owned_exit_requires_fresh_broker_reconciliation() -> None:
+    """A replayed exit for BTS-owned exposure must use fresh IB/BTS state."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "def recover_replayed_owned_exit("
+    )
+
+    helper_end = source.index(
+        "def recover_reserved_exit_for_snapshot(",
+        helper_index,
+    )
+
+    helper_source = source[
+        helper_index:helper_end
+    ]
+
+    # The recovery helper itself must obtain fresh broker and lifecycle state.
+    assert "refresh_position_snapshot" in helper_source
+    assert "get_mbt_position(" in helper_source
+    assert "load_durable_open_signals(" in helper_source
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    replay_index = runner_source.index(
+        "if was_replay_event:"
+    )
+
+    live_boundary_index = runner_source.index(
+        "# LIVE lifecycle event.",
+        replay_index,
+    )
+
+    replay_source = runner_source[
+        replay_index:live_boundary_index
+    ]
+
+    # The historical replay path must explicitly route an owned exit
+    # through the fresh-state recovery helper.
+    assert "recover_replayed_owned_exit(" in replay_source
+
+
+def test_replayed_owned_exit_broker_flat_never_submits_recovery_order() -> None:
+    """A replayed owned exit must not send another close when IB is flat."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "def recover_replayed_owned_exit("
+    )
+
+    helper_end = source.index(
+        "def recover_reserved_exit_for_snapshot(",
+        helper_index,
+    )
+
+    helper_source = source[
+        helper_index:helper_end
+    ]
+
+    # The helper must explicitly classify the already-flat case.
+    assert "broker_position == 0" in helper_source
+
+    # Already-flat means there is no remaining broker exposure to close.
+    assert "REPLAYED_EXIT_BROKER_ALREADY_FLAT" in helper_source
+
+    # This helper is an inspection/classification boundary. It must never
+    # place or submit a broker order itself.
+    forbidden_submission_calls = (
+        "placeOrder(",
+        "execution_client.submit(",
+        "execution_client.submit_reserved(",
+        "submit_reserved(",
+        "reserve_execution(",
+    )
+
+    for forbidden_call in forbidden_submission_calls:
+        assert forbidden_call not in helper_source
+
+
+def test_replayed_owned_exit_broker_flat_requires_exact_signal_match_before_lifecycle_close() -> None:
+    """Broker-flat replay recovery may close only the matching BTS lifecycle."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "def recover_replayed_owned_exit("
+    )
+
+    helper_end = source.index(
+        "def recover_reserved_exit_for_snapshot(",
+        helper_index,
+    )
+
+    helper_source = source[
+        helper_index:helper_end
+    ]
+
+    # The recovery helper must know which Eagle signal is being recovered.
+    assert "signal_id:" in helper_source
+
+    # Broker-flat recovery is only meaningful when BTS still has exactly
+    # one durable open lifecycle.
+    assert "len(open_signals) != 1" in helper_source
+
+    # That durable lifecycle must belong to the replayed Eagle exit.
+    assert "open_signals[0].signal_id != signal_id" in helper_source
+
+    # The already-flat state must remain explicitly classified.
+    assert "REPLAYED_EXIT_BROKER_ALREADY_FLAT" in helper_source
+
+    # A signal mismatch must fail closed rather than altering lifecycle state.
+    assert "REPLAYED_EXIT_SIGNAL_MISMATCH" in helper_source
+
+
+def test_replayed_owned_exit_broker_flat_matching_signal_closes_lifecycle_only() -> None:
+    """A matching replayed exit may reconcile lifecycle when IB is already flat."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "def recover_replayed_owned_exit("
+    )
+
+    helper_end = source.index(
+        "def recover_reserved_exit_for_snapshot(",
+        helper_index,
+    )
+
+    helper_source = source[
+        helper_index:helper_end
+    ]
+
+    # Broker-flat reconciliation must first prove that exactly one
+    # durable BTS open signal exists.
+    assert "len(open_signals) != 1" in helper_source
+
+    # The replayed Eagle exit must match that exact durable signal.
+    assert "open_signals[0].signal_id != signal_id" in helper_source
+
+    # Once IB is already flat and the signal matches, the helper must
+    # explicitly classify this as lifecycle-only reconciliation.
+    assert "REPLAYED_EXIT_LIFECYCLE_ONLY_RECONCILIATION" in helper_source
+
+    # The lifecycle reconciliation must be an explicit caller-supplied
+    # operation rather than an implicit database edit inside this helper.
+    assert "close_matching_lifecycle:" in helper_source
+    assert "close_matching_lifecycle(signal_id)" in helper_source
+
+    # Absolutely no IB order may be created, reserved, or submitted by
+    # this broker-flat lifecycle-only path.
+    forbidden_submission_calls = (
+        "placeOrder(",
+        "execution_client.submit(",
+        "execution_client.submit_reserved(",
+        "submit_reserved(",
+        "reserve_execution(",
+    )
+
+    for forbidden_call in forbidden_submission_calls:
+        assert forbidden_call not in helper_source
+
+
+def test_replayed_owned_exit_with_expected_broker_position_establishes_recovery_obligation() -> None:
+    """A matching replayed exit with live broker exposure must become a durable close obligation."""
+
+    source = script_source()
+
+    helper_index = source.index(
+        "def recover_replayed_owned_exit("
+    )
+
+    helper_end = source.index(
+        "def recover_reserved_exit_for_snapshot(",
+        helper_index,
+    )
+
+    helper_source = source[
+        helper_index:helper_end
+    ]
+
+    # The helper must explicitly distinguish the broker-still-positioned case
+    # from the broker-already-flat lifecycle-only path.
+    assert "REPLAYED_EXIT_BROKER_EXPOSURE_REMAINS" in helper_source
+
+    # It must require one exact durable open signal.
+    assert "len(open_signals) != 1" in helper_source
+    assert "open_signals[0].signal_id != signal_id" in helper_source
+
+    # Remaining broker exposure must match the configured runtime quantity.
+    assert "broker_position not in {-expected_quantity, expected_quantity}" in helper_source
+
+    # The lifecycle direction must agree with broker direction.
+    assert "SignalLifecycleState.LONG_OPEN" in helper_source
+    assert "SignalLifecycleState.SHORT_OPEN" in helper_source
+
+    # The helper should establish a durable recovery obligation through
+    # a caller-supplied operation, not submit directly to IB.
+    assert "reserve_recovery_exit:" in helper_source
+    assert "reserve_recovery_exit(signal_id)" in helper_source
+
+    # This inspection/classification boundary still must not place an IB order.
+    forbidden_submission_calls = (
+        "placeOrder(",
+        "execution_client.submit(",
+        "execution_client.submit_reserved(",
+        "submit_reserved(",
+    )
+
+    for forbidden_call in forbidden_submission_calls:
+        assert forbidden_call not in helper_source
+
+
+def test_replayed_owned_exit_recovery_waits_for_post_replay_heartbeat() -> None:
+    """A replay-created close obligation must not execute until live session gates reopen."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+    runner_source = source[runner_index:]
+
+    heartbeat_index = runner_source.index(
+        "if isinstance(message, EagleHeartbeat):"
+    )
+
+    hello_index = runner_source.index(
+        "if isinstance(message, EagleHello):",
+        heartbeat_index,
+    )
+
+    heartbeat_source = runner_source[
+        heartbeat_index:hello_index
+    ]
+
+    # A RESERVED recovery exit discovered on a heartbeat must remain blocked
+    # unless replay is complete.
+    assert "if not replay_complete:" in heartbeat_source
+
+    # The current heartbeat must explicitly become the fresh post-replay
+    # authorization heartbeat before recovery submission is permitted.
+    assert "post_replay_heartbeat_seen = True" in heartbeat_source
+
+    # Recovery of the durable close obligation must occur only after those
+    # session gates have been satisfied.
+    gate_index = heartbeat_source.index(
+        "post_replay_heartbeat_seen = True"
+    )
+
+    recovery_index = heartbeat_source.index(
+        "recover_reserved_exit_obligation"
+    )
+
+    assert gate_index < recovery_index
+
+
+def test_reserved_replay_exit_refreshes_broker_immediately_before_submission() -> None:
+    """Recovery must re-check IB position immediately before a reserved close is submitted."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    recovery_index = source.index(
+        "def recover_reserved_exit_obligation(",
+        runner_index,
+    )
+
+    recovery_end = source.index(
+        "    try:",
+        recovery_index,
+    )
+
+    recovery_source = source[
+        recovery_index:recovery_end
+    ]
+
+    # We require two completed broker position refreshes:
+    # one for the initial recovery/reconciliation check and another
+    # immediately before broker submission.
+    assert recovery_source.count(
+        "refresh_position_snapshot("
+    ) >= 2
+
+    submit_guard_index = recovery_source.index(
+        "guard_reserved_exit_resubmission("
+    )
+
+    refresh_indexes = []
+    search_from = 0
+
+    while True:
+        found = recovery_source.find(
+            "refresh_position_snapshot(",
+            search_from,
+        )
+
+        if found == -1:
+            break
+
+        refresh_indexes.append(found)
+        search_from = found + 1
+
+    # At least one fresh IB snapshot must occur after readiness has passed
+    # and before the final resubmission guard can reach submit_reserved().
+    readiness_index = recovery_source.index(
+        "readiness.require_ready("
+    )
+
+    final_refreshes = [
+        index
+        for index in refresh_indexes
+        if readiness_index < index < submit_guard_index
+    ]
+
+    assert final_refreshes
+
+    # The final snapshot must be converted into a fresh MBT position used
+    # for the submission decision rather than reusing an earlier value.
+    final_refresh_index = final_refreshes[-1]
+
+    fresh_position_index = recovery_source.index(
+        "get_mbt_position(",
+        final_refresh_index,
+    )
+
+    assert fresh_position_index < submit_guard_index
+
+
+def test_reserved_replay_exit_manual_flatten_reconciles_lifecycle_without_submission() -> None:
+    """If IB is flat at the final refresh, recovery must close lifecycle only."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    recovery_index = source.index(
+        "def recover_reserved_exit_obligation(",
+        runner_index,
+    )
+
+    recovery_end = source.index(
+        "    try:",
+        recovery_index,
+    )
+
+    recovery_source = source[
+        recovery_index:recovery_end
+    ]
+
+    # The final-refresh flat case must be explicitly classified.
+    assert "RESERVED_EXIT_BROKER_ALREADY_FLAT" in recovery_source
+
+    # That path must reconcile the durable BTS lifecycle rather than
+    # attempting another broker close.
+    assert "RESERVED_EXIT_LIFECYCLE_ONLY_RECONCILIATION" in recovery_source
+
+    # It must explicitly commit the matching closing lifecycle.
+    assert "coordinator.commit_request(" in recovery_source
+
+    # The flat branch must occur before the normal resubmission path.
+    flat_index = recovery_source.index(
+        "RESERVED_EXIT_BROKER_ALREADY_FLAT"
+    )
+
+    guard_index = recovery_source.index(
+        "guard_reserved_exit_resubmission("
+    )
+
+    assert flat_index < guard_index
+
+    # Submission must remain downstream of the flat escape path.
+    submit_index = recovery_source.index(
+        "submit_reserved("
+    )
+
+    assert flat_index < submit_index
+
+
+def test_reserved_replay_exit_manual_flatten_resolves_execution_record() -> None:
+    """Manual-flat recovery must not leave the durable exit RESERVED."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    recovery_index = source.index(
+        "def recover_reserved_exit_obligation(",
+        runner_index,
+    )
+
+    recovery_end = source.index(
+        "    try:",
+        recovery_index,
+    )
+
+    recovery_source = source[
+        recovery_index:recovery_end
+    ]
+
+    flat_index = recovery_source.index(
+        "RESERVED_EXIT_BROKER_ALREADY_FLAT"
+    )
+
+    return_index = recovery_source.index(
+        "            return",
+        flat_index,
+    )
+
+    flat_source = recovery_source[
+        flat_index:return_index
+    ]
+
+    # The manual-flat path must explicitly resolve the durable
+    # RESERVED execution record before returning.
+    assert "RESERVED_EXIT_EXECUTION_RESOLVED_WITHOUT_SUBMISSION" in flat_source
+
+    # Resolution must be performed through the execution ledger/client,
+    # not by directly editing SQLite from the runner.
+    assert (
+        "execution_ledger." in flat_source
+        or "execution_client." in flat_source
+    )
+
+    # The path must verify that the execution is no longer RESERVED.
+    assert "ExecutionStatus.RESERVED" in flat_source
+
+
+def test_reserved_replay_exit_position_mismatch_fails_closed_before_submission() -> None:
+    """Unexpected broker exposure must fail closed before recovery submission."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    recovery_index = source.index(
+        "def recover_reserved_exit_obligation(",
+        runner_index,
+    )
+
+    recovery_end = source.index(
+        "    try:",
+        recovery_index,
+    )
+
+    recovery_source = source[
+        recovery_index:recovery_end
+    ]
+
+    # The final fresh broker position must be validated after the
+    # manual-flat escape path and before the resubmission guard.
+    flat_index = recovery_source.index(
+        "if recovery_position == 0:"
+    )
+
+    guard_index = recovery_source.index(
+        "guard_reserved_exit_resubmission("
+    )
+
+    assert "RESERVED_EXIT_BROKER_POSITION_MISMATCH" in recovery_source
+
+    mismatch_index = recovery_source.index(
+        "RESERVED_EXIT_BROKER_POSITION_MISMATCH"
+    )
+
+    assert flat_index < mismatch_index < guard_index
+
+    # The expected exposure must be derived from the closing intent,
+    # not merely accepted because its absolute quantity looks valid.
+    assert "TradeIntent.SELL_TO_CLOSE" in recovery_source
+    assert "TradeIntent.BUY_TO_CLOSE" in recovery_source
+
+    assert "expected_recovery_position" in recovery_source
+
+    # Any mismatch must raise before the normal submission path.
+    mismatch_source = recovery_source[
+        mismatch_index:guard_index
+    ]
+
+    assert "raise RuntimeError(" in mismatch_source
+
+    # The mismatch branch must not resolve/close the durable lifecycle
+    # or execution obligation. Those states are preserved for diagnosis.
+    assert "coordinator.commit_request(" not in mismatch_source
+    assert "execution_ledger.mark_rejected(" not in mismatch_source
+
+    # The mismatch branch itself must raise before the normal
+    # resubmission guard can be reached.
+    raise_index = recovery_source.index(
+        "raise RuntimeError(",
+    mismatch_index,
+    )
+
+    assert mismatch_index < raise_index < guard_index
+
+
+def test_eagle_hello_flat_with_matching_bts_broker_position_defers_for_gap_exit_replay() -> None:
+    """Reconnect Hello may defer one exact BTS-owned position for replayed exit."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    hello_index = source.index(
+        "if isinstance(message, EagleHello):",
+        runner_index,
+    )
+
+    reconciliation_index = source.index(
+        "require_eagle_hello_reconciled(",
+        hello_index,
+    )
+
+    hello_source = source[
+        hello_index:reconciliation_index
+    ]
+
+    # The reconnect path needs an explicit, narrowly named state for the
+    # situation where Eagle is flat but BTS and IB still agree that BTS
+    # owns one position which may have received an EXIT during the gap.
+    assert "possible_pending_gap_exit" in hello_source
+
+    # Eagle must actually be flat for this exception.
+    assert "len(relevant_eagle_open_positions) == 0" in hello_source
+
+    # BTS must have exactly one durable open signal.
+    assert "len(hello_open_signals) == 1" in hello_source
+
+    # Broker exposure must still exist and must exactly match the
+    # configured quantity/direction rather than merely be non-zero.
+    assert "expected_gap_position" in hello_source
+    assert "execution_config.quantity" in hello_source
+    assert "hello_broker_position == expected_gap_position" in hello_source
+
+    # The state must visibly block normal broker authorization while
+    # replay is given the opportunity to explain the discrepancy.
+    assert "POSSIBLE_PENDING_GAP_EXIT" in hello_source
+    assert "Broker execution remains blocked" in hello_source
+
+
+def test_unresolved_pending_gap_exit_fails_closed_after_replay() -> None:
+    """A pending gap exit must fail closed if replay never explains it."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    hello_index = source.index(
+        "if isinstance(message, EagleHello):",
+        runner_index,
+    )
+
+    heartbeat_index = source.index(
+        "elif isinstance(message, EagleHeartbeat):",
+        hello_index,
+    )
+
+    heartbeat_source = source[
+        heartbeat_index:
+        source.index(
+            "elif ",
+            heartbeat_index + len(
+                "elif isinstance(message, EagleHeartbeat):"
+            ),
+        )
+    ]
+
+    # Once replay is complete, an unresolved pending-gap state must
+    # stop the runner rather than allowing the heartbeat to authorize
+    # normal broker execution.
+    assert "possible_pending_gap_exit and replay_complete" in heartbeat_source
+
+    assert "POSSIBLE_PENDING_GAP_EXIT remained unresolved" in heartbeat_source
+
+    unresolved_index = heartbeat_source.index(
+        "possible_pending_gap_exit and replay_complete"
+    )
+
+    raise_index = heartbeat_source.index(
+        "raise RuntimeError(",
+        unresolved_index,
+    )
+
+    # The post-replay heartbeat authorization must occur only after
+    # this unresolved-gap fail-closed check.
+    authorization_index = heartbeat_source.index(
+        "post_replay_heartbeat_seen = True"
+    )
+
+    assert unresolved_index < raise_index < authorization_index
+
+
+def test_pending_gap_exit_clears_only_after_matching_replayed_owned_exit() -> None:
+    """Only the BTS-owned replayed exit may clear pending-gap state."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    replay_index = source.index(
+        "PENDING GAP EXIT EXPLAINED BY MATCHING REPLAY.",
+        runner_index,
+    )
+
+    # The pending-gap state may be cleared only inside the replayed
+    # owned-exit handling path, after recover_replayed_owned_exit()
+    # has validated the signal against durable BTS lifecycle/broker state.
+    recovery_index = source.rfind(
+        "recover_replayed_owned_exit(",
+        runner_index,
+        replay_index,
+    )
+
+    clear_index = source.rfind(
+        "possible_pending_gap_exit = False",
+        recovery_index,
+        replay_index,
+    )
+
+    assert recovery_index != -1
+    assert clear_index != -1
+
+    assert recovery_index < clear_index < replay_index
+
+    # The replay recovery call must receive the replay message's
+    # signal ID so exact ownership can be checked.
+    recovery_source = source[
+        recovery_index:clear_index
+    ]
+
+    assert "signal_id=message.signal_id" in recovery_source
+
+    # The diagnostic should explicitly describe this as a matching replay,
+    # not merely any replay activity.
+    assert "PENDING GAP EXIT EXPLAINED BY MATCHING REPLAY." in source
+
+
+def test_replayed_owned_exit_establishes_recovery_state_before_event_consumption() -> None:
+    """Owned replay EXIT must establish recovery state before durable consume."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    replay_branch_index = source.index(
+        "if was_replay_event:",
+        runner_index,
+    )
+
+    replay_exit_index = source.index(
+        'elif message.message_type == "fund.exit":',
+        replay_branch_index,
+    )
+
+    next_branch_index = source.index(
+        'elif message.message_type not in {"fund.entry", "fund.exit"}:',
+        replay_exit_index,
+    )
+
+    recovery_index = source.index(
+        "recover_replayed_owned_exit(",
+        replay_exit_index,
+        next_branch_index,
+    )
+
+    # The final durable Eagle consume for an owned replay EXIT must occur
+    # inside the EXIT branch, after recovery state has been established.
+    event_process_index = source.find(
+        "event_processor.process(message)",
+        replay_exit_index,
+        next_branch_index,
+    )
+
+    assert event_process_index != -1
+
+    # Safety invariant:
+    #
+    # Recovery state must be durable before the Eagle event is marked
+    # processed and the durable sequence cursor advances.
+    assert recovery_index < event_process_index
+
+def test_replayed_owned_exit_broker_flat_replay_after_lifecycle_close_is_idempotent() -> None:
+    """A replayed EXIT must recognize its already-completed lifecycle close."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    replay_branch_index = source.index(
+        "if was_replay_event:",
+        runner_index,
+    )
+
+    replay_exit_index = source.index(
+        'elif message.message_type == "fund.exit":',
+        replay_branch_index,
+    )
+
+    recovery_index = source.index(
+        "recover_replayed_owned_exit(",
+        replay_exit_index,
+    )
+
+    recovery_source = source[
+        replay_exit_index:
+        recovery_index
+    ]
+
+    # Crash-restart invariant:
+    #
+    # If lifecycle-only reconciliation completed before a crash but the
+    # Eagle event/cursor did not, replay must prove that this exact EXIT
+    # already closed this exact signal.
+    assert "lifecycle_guard.get_snapshot(" in recovery_source
+    assert "SignalLifecycleState.CLOSED" in recovery_source
+    assert "snapshot.last_event_id" in recovery_source
+    assert "message.event_id" in recovery_source
+
+def test_replayed_owned_exit_checks_event_eligibility_before_recovery() -> None:
+    """Duplicate/stale replay EXIT must be rejected before recovery side effects."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    replay_branch_index = source.index(
+        "if was_replay_event:",
+        runner_index,
+    )
+
+    eligibility_index = source.index(
+        "event_store.check_event_with_seq(",
+        replay_branch_index,
+    )
+
+    eligibility_gate_index = source.index(
+        "replay_eligibility",
+        eligibility_index
+        + len("event_store.check_event_with_seq("),
+    )
+
+    replay_exit_index = source.index(
+        'elif message.message_type == "fund.exit":',
+        eligibility_index,
+    )
+
+    next_branch_index = source.index(
+        'elif message.message_type not in {"fund.entry", "fund.exit"}:',
+        replay_exit_index,
+    )
+
+    recovery_index = source.index(
+        "recover_replayed_owned_exit(",
+        replay_exit_index,
+        next_branch_index,
+    )
+
+    durable_consume_index = source.index(
+        "event_processor.process(message)",
+        recovery_index,
+        next_branch_index,
+    )
+
+    # Safety ordering:
+    #
+    # 1. Read-only event/sequence eligibility is checked first.
+    # 2. Only then may the replayed owned EXIT establish recovery state.
+    # 3. Only after recovery state exists may the Eagle event/cursor
+    #    be durably consumed.
+    assert eligibility_index < replay_exit_index
+    assert eligibility_gate_index < replay_exit_index
+    assert replay_exit_index < recovery_index
+    assert recovery_index < durable_consume_index
+
+    # The replay branch must explicitly prevent anything other than an
+    # ACCEPTED event from reaching the owned-exit recovery path.
+    pre_exit_source = source[
+        eligibility_index:
+        replay_exit_index
+    ]
+
+    assert (
+        "replay_eligibility"
+        in pre_exit_source
+    )
+
+    assert (
+        "is not EventProcessingResult.ACCEPTED"
+        in pre_exit_source
+    )
+
+
+@pytest.mark.parametrize(
+    "rejected_result",
+    [
+        "DUPLICATE_EVENT",
+        "OUT_OF_SEQUENCE",
+    ],
+)
+def test_replayed_owned_exit_rejected_eligibility_cannot_reach_recovery(
+    rejected_result: str,
+) -> None:
+    """Duplicate/stale replay EXIT must stop before recovery side effects."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    replay_branch_index = source.index(
+        "if was_replay_event:",
+        runner_index,
+    )
+
+    eligibility_index = source.index(
+        "event_store.check_event_with_seq(",
+        replay_branch_index,
+    )
+
+    replay_exit_index = source.index(
+        'elif message.message_type == "fund.exit":',
+        eligibility_index,
+    )
+
+    recovery_index = source.index(
+        "recover_replayed_owned_exit(",
+        replay_exit_index,
+    )
+
+    pre_exit_source = source[
+        eligibility_index:
+        replay_exit_index
+    ]
+
+    # The runner must use the read-only eligibility result as a hard
+    # boundary before the owned replay EXIT recovery branch.
+    assert (
+        "replay_eligibility"
+        in pre_exit_source
+    )
+
+    assert (
+        "is not EventProcessingResult.ACCEPTED"
+        in pre_exit_source
+    )
+
+    assert (
+        "Duplicate/out-of-sequence replay event stopped."
+        in pre_exit_source
+    )
+
+    # Recovery must exist only after that rejection boundary.
+    assert eligibility_index < replay_exit_index
+    assert replay_exit_index < recovery_index
+
+    # The rejected classifications themselves are intentionally handled
+    # by EventStore.check_event_with_seq(). This parameterization documents
+    # the two states that must be unable to cross the ACCEPTED-only gate.
+    assert rejected_result in {
+        "DUPLICATE_EVENT",
+        "OUT_OF_SEQUENCE",
+    }
+
+def test_startup_allows_unconsumed_reserved_exit_only_for_replay_reconciliation() -> None:
+    """An unconsumed RESERVED exit may enter replay reconciliation, not normal trading."""
+
+    source = script_source()
+
+    runner_index = source.index(
+        "async def run_continuous_paper_trader("
+    )
+
+    reserved_index = source.index(
+        "reserved_exit = find_reserved_exit(",
+        runner_index,
+    )
+
+    listener_index = source.index(
+        "async for message in eagle_client.listen():",
+        reserved_index,
+    )
+
+    startup_source = source[
+        reserved_index:
+        listener_index
+    ]
+
+    # Startup must distinguish an ordinary RESERVED exit whose Eagle
+    # event was already consumed from the narrow reserve-before-consume
+    # crash state whose Eagle event is still absent from EventStore.
+    assert (
+        "event_store.has_processed_event("
+        in startup_source
+    )
+
+    assert (
+        "reserved_exit.event_id"
+        in startup_source
+    )
+
+    # Give the exceptional startup state an explicit identity.
+    assert (
+        "reserved_exit_pending_replay"
+        in startup_source
+    )
+
+    # Startup must validate the RESERVED obligation against durable
+    # lifecycle state before permitting replay reconciliation.
+    assert (
+        "load_durable_open_signals("
+        in startup_source
+    )
+
+    assert (
+        "reserved_exit.signal_id"
+        in startup_source
+    )
+
+    assert (
+        "reserved_exit.intent"
+        in startup_source
+    )
+
+    assert (
+        "reserved_exit.quantity"
+        in startup_source
+    )
+
+    assert (
+        "reserved_exit.broker_order_id"
+        in startup_source
+    )
+
+    # Existing operator-controlled recovery remains available for an
+    # ordinary RESERVED exit whose Eagle event was already consumed.
+    assert (
+        RECOVERY_ARGUMENT
+        in startup_source
+    )
+
+    # The pending-replay state must survive into the listener/heartbeat
+    # control flow. Merely reaching replay completion must not authorize
+    # the pre-existing RESERVED order.
+    heartbeat_index = source.index(
+        "if isinstance(message, EagleHeartbeat):",
+        listener_index,
+    )
+
+    heartbeat_end_index = source.index(
+        "if isinstance(message, EagleHello):",
+        heartbeat_index,
+    )
+
+    heartbeat_source = source[
+        heartbeat_index:
+        heartbeat_end_index
+    ]
+
+    assert (
+        "reserved_exit_pending_replay"
+        in heartbeat_source
+    )
+
+    assert (
+        "recover_reserved_exit_obligation"
+        in heartbeat_source
+    )
